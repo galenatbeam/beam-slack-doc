@@ -16,8 +16,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Search documentation with AgenticSearch.",
         epilog=(
-            "Required env vars: OPENAI_API_KEY and MCP_AUTH_HEADER. "
-            "Optional: OPENAI_MODEL, CONFLUENCE_SPACE, MCP_SERVER_URL, MCP_SERVER_NAME."
+            "Required env vars: MCP_AUTH_HEADER plus either OPENAI_API_KEY "
+            "(OpenAI-hosted mode) or LLM_BASE_URL=http://localhost:11434/v1 "
+            "(local Ollama mode; OPENAI_API_KEY optional). Optional: OPENAI_MODEL, "
+            "CONFLUENCE_SPACE, MCP_SERVER_URL, MCP_SERVER_NAME."
         ),
     )
     parser.add_argument("query", help="Question or keywords to search for")
