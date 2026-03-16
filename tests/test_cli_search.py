@@ -81,7 +81,7 @@ def test_main_returns_error_for_missing_required_config(monkeypatch, capsys):
 
     assert exit_code == 1
     assert "OPENAI_API_KEY" in captured.err
-    assert "MCP_AUTH_HEADER" in captured.err
+    assert "Atlassian auth" in captured.err
 
 
 def test_main_allows_local_mode_without_real_openai_api_key(monkeypatch, capsys):
@@ -114,3 +114,13 @@ def test_parser_uses_exit_code_two_for_invalid_usage():
         cli_search.main([])
 
     assert excinfo.value.code == 2
+
+
+def test_help_mentions_agentic_search_debug(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli_search.main(["--help"])
+
+    captured = capsys.readouterr()
+
+    assert excinfo.value.code == 0
+    assert "AGENTIC_SEARCH_DEBUG" in captured.out

@@ -6,6 +6,9 @@ import asyncio
 import base64
 import json
 import os
+import re
+import sys
+import traceback
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Mapping, Sequence
 
@@ -43,6 +46,37 @@ ATLASSIAN_AUTH_CONFIG = (
     "MCP_AUTH_HEADER or ATLASSIAN_SERVICE_ACCOUNT_KEY or "
     "ATLASSIAN_API_EMAIL + ATLASSIAN_API_TOKEN"
 )
+DEBUG_ENV_VAR = "AGENTIC_SEARCH_DEBUG"
+DEBUG_TRUE_VALUES = {"1", "true", "yes"}
+TRACEBACK_CHAR_LIMIT = 2000
+SECRET_KEY_FRAGMENTS = (
+    "auth",
+    "authorization",
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "api_key",
+    "apikey",
+    "email",
+    "bearer",
+    "basic",
+)
+SECRET_VALUE_PATTERNS = (
+    (re.compile(r"Bearer\s+[^\s]+", re.IGNORECASE), "[REDACTED_AUTH]"),
+    (re.compile(r"Basic\s+[^\s]+", re.IGNORECASE), "[REDACTED_AUTH]"),
+    (
+        re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+        "[REDACTED_EMAIL]",
+    ),
+    (
+        re.compile(
+            r"(?i)(api[_ -]?token|api[_ -]?key|access[_ -]?token|authorization|password|secret)"
+            r"\s*[:=]\s*[^\s,;]+"
+        ),
+        "[REDACTED_SECRET]",
+    ),
+)
 
 
 def build_mcp_auth_header(
@@ -68,6 +102,10 @@ def build_mcp_auth_header(
         return f"Basic {encoded_credentials}"
 
     return ""
+
+
+def _env_flag(value: str | None) -> bool:
+    return (value or "").strip().lower() in DEBUG_TRUE_VALUES
 
 
 class Citation(BaseModel):
@@ -141,6 +179,9 @@ class AgenticSearch:
         self.mcp_auth_header = build_mcp_auth_header(mcp_auth_header)
         self.mcp_cloud_id = (mcp_cloud_id or os.getenv("MCP_CLOUD_ID", "")).strip()
         self.max_results = max(1, max_results)
+        self.debug_enabled = _env_flag(os.getenv(DEBUG_ENV_VAR))
+        self._debug_state: dict[str, Any] | None = None
+        self._debug_last_step: str | None = None
 
     @property
     def uses_local_llm(self) -> bool:
@@ -148,16 +189,18 @@ class AgenticSearch:
 
     def search(self, query: str) -> Dict[str, Any]:
         """Search documentation and return a structured answer with citations."""
+        self._reset_debug_state()
         clean_query = query.strip()
         if not clean_query:
+            raw_response = {
+                "status": "invalid_query",
+                "model": self.model,
+                "mcp_server_url": self.mcp_server_url,
+            }
             return {
                 "answer": "Please provide a question or keywords to search the documentation.",
                 "citations": [],
-                "raw_response": {
-                    "status": "invalid_query",
-                    "model": self.model,
-                    "mcp_server_url": self.mcp_server_url,
-                },
+                "raw_response": self._with_debug(raw_response),
             }
 
         if not self.uses_local_llm and not self.openai_api_key:
@@ -167,6 +210,7 @@ class AgenticSearch:
             return self._configuration_error_response(clean_query, ATLASSIAN_AUTH_CONFIG)
 
         try:
+            self._start_debug_session()
             return asyncio.run(self._search_async(clean_query))
         except Exception as exc:  # pragma: no cover - exercised via public response path
             return self._error_response(clean_query, "search_error", exc)
@@ -188,14 +232,27 @@ class AgenticSearch:
         self._configure_agents_sdk()
 
         async with self._build_mcp_server() as server:
+            self._set_last_step("list_tools")
             tools = await server.list_tools()
+            tool_names = [tool.name for tool in tools]
+            self._record_debug("list_tools", {"tool_names": tool_names})
             tool_map = {tool.name: tool for tool in tools}
             strategy = self._select_strategy(tool_map)
             if strategy is None:
                 raise RuntimeError("No supported Atlassian Rovo search tools were available.")
+            self._record_debug(
+                "strategy",
+                {
+                    "strategy": strategy.name,
+                    "search_tool": strategy.search_tool,
+                    "fetch_tool": strategy.fetch_tool,
+                },
+            )
 
             cloud_id = await self._resolve_cloud_id(server, tool_map, strategy)
-            search_payload = await server.call_tool(
+            self._record_debug("cloud_id", {"cloud_id": cloud_id})
+            search_payload = await self._call_tool(
+                server,
                 strategy.search_tool,
                 self._build_search_arguments(
                     tool_map[strategy.search_tool],
@@ -207,19 +264,20 @@ class AgenticSearch:
             documents = self._normalize_documents(search_payload, source=strategy.search_tool)
 
             if not documents:
+                raw_response = {
+                    "status": "no_results",
+                    "strategy": strategy.name,
+                    "model": self.model,
+                    "query": query,
+                    "selected_tools": [strategy.search_tool, strategy.fetch_tool],
+                }
                 return {
                     "answer": (
                         f"I couldn't find relevant documentation for '{query}'. Try adding more "
                         "specific keywords, a product name, or a team-specific term."
                     ),
                     "citations": [],
-                    "raw_response": {
-                        "status": "no_results",
-                        "strategy": strategy.name,
-                        "model": self.model,
-                        "query": query,
-                        "selected_tools": [strategy.search_tool, strategy.fetch_tool],
-                    },
+                    "raw_response": self._with_debug(raw_response),
                 }
 
             fetch_errors: list[dict[str, str]] = []
@@ -232,25 +290,25 @@ class AgenticSearch:
                     fetch_errors,
                 )
 
+            self._set_last_step("synthesis")
             synthesized = await self._synthesize_answer(query, documents)
             citations = self._normalize_citations(synthesized.citations, documents)
 
             if not citations:
                 citations = self._fallback_citations(documents)
 
+            raw_response = {
+                "status": "ok",
+                "strategy": strategy.name,
+                "model": self.model,
+                "query": query,
+                "selected_tools": [strategy.search_tool, strategy.fetch_tool],
+                "fetch_errors": fetch_errors,
+            }
             return {
                 "answer": synthesized.answer.strip(),
                 "citations": [citation.model_dump() for citation in citations],
-                "raw_response": {
-                    "status": "ok",
-                    "strategy": strategy.name,
-                    "model": self.model,
-                    "query": query,
-                    "selected_tools": [strategy.search_tool, strategy.fetch_tool],
-                    "documents": [self._document_debug_view(doc) for doc in documents],
-                    "fetch_errors": fetch_errors,
-                    "model_output": synthesized.model_dump(),
-                },
+                "raw_response": self._with_debug(raw_response),
             }
 
     def _build_mcp_server(self) -> MCPServerStreamableHttp:
@@ -305,7 +363,7 @@ class AgenticSearch:
         if ACCESSIBLE_RESOURCES_TOOL not in tool_map:
             return None
 
-        resources_payload = await server.call_tool(ACCESSIBLE_RESOURCES_TOOL, {})
+        resources_payload = await self._call_tool(server, ACCESSIBLE_RESOURCES_TOOL, {})
         for resource in self._iter_nested_dicts(self._extract_payload(resources_payload)):
             cloud_id = self._first_string(resource, ("cloudId",))
             if cloud_id:
@@ -388,9 +446,8 @@ class AgenticSearch:
         enriched: list[DocumentResult] = []
         for document in documents[:MAX_FETCH_RESULTS]:
             try:
-                payload = await server.call_tool(
-                    tool.name,
-                    self._build_fetch_arguments(tool, document, cloud_id),
+                payload = await self._call_tool(
+                    server, tool.name, self._build_fetch_arguments(tool, document, cloud_id)
                 )
                 merged = self._merge_document(
                     document,
@@ -692,42 +749,182 @@ class AgenticSearch:
 
     def _document_debug_view(self, document: DocumentResult) -> dict[str, Any]:
         debug_document = asdict(document)
-        if debug_document.get("content"):
-            debug_document["content_preview"] = debug_document["content"][:500]
-            debug_document.pop("content")
+        debug_document.pop("content", None)
         return debug_document
+
+    async def _call_tool(
+        self,
+        server: Any,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> Any:
+        self._set_last_step(f"call_tool:{tool_name}")
+        call_debug = {
+            "tool_name": tool_name,
+            "argument_keys": [self._sanitize_key_name(key) for key in arguments.keys()],
+        }
+        try:
+            payload = await server.call_tool(tool_name, dict(arguments))
+        except Exception as exc:
+            call_debug["error_type"] = type(exc).__name__
+            self._record_call_debug(call_debug)
+            raise
+
+        call_debug["response_summary"] = self._summarize_payload(payload)
+        self._record_call_debug(call_debug)
+        return payload
+
+    def _reset_debug_state(self) -> None:
+        self._debug_state = None
+        self._debug_last_step = None
+
+    def _start_debug_session(self) -> None:
+        if not self.debug_enabled:
+            return
+        self._debug_state = {
+            "mcp_server_url": self.mcp_server_url,
+            "mcp_server_name": self.mcp_server_name,
+            "calls": [],
+        }
+        self._record_debug(
+            "mcp_server",
+            {
+                "mcp_server_url": self.mcp_server_url,
+                "mcp_server_name": self.mcp_server_name,
+            },
+        )
+
+    def _set_last_step(self, step: str) -> None:
+        self._debug_last_step = step
+        if self._debug_state is not None:
+            self._debug_state["last_step"] = step
+
+    def _record_debug(self, label: str, details: Mapping[str, Any]) -> None:
+        if not self.debug_enabled:
+            return
+        sanitized = self._sanitize_debug_object(dict(details))
+        if self._debug_state is not None:
+            self._debug_state[label] = sanitized
+        print(
+            f"[AgenticSearch debug] {label}: {json.dumps(sanitized, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+
+    def _record_call_debug(self, call_debug: Mapping[str, Any]) -> None:
+        if not self.debug_enabled:
+            return
+        sanitized = self._sanitize_debug_object(dict(call_debug))
+        if self._debug_state is not None:
+            self._debug_state.setdefault("calls", []).append(sanitized)
+        print(
+            f"[AgenticSearch debug] call_tool: {json.dumps(sanitized, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+
+    def _summarize_payload(self, payload: Any) -> dict[str, Any]:
+        extracted = self._extract_payload(payload)
+        summary: dict[str, Any] = {"payload_type": type(extracted).__name__}
+        if isinstance(extracted, dict):
+            keys: list[str] = []
+            counts: dict[str, int] = {}
+            for key, value in extracted.items():
+                safe_key = self._sanitize_key_name(key)
+                keys.append(safe_key)
+                count = self._summary_count(value)
+                if count is not None:
+                    counts[safe_key] = count
+            summary["top_level_keys"] = keys
+            if counts:
+                summary["counts"] = counts
+            return summary
+        if isinstance(extracted, list):
+            summary["top_level_keys"] = []
+            summary["counts"] = {"items": len(extracted)}
+            return summary
+        summary["top_level_keys"] = []
+        return summary
+
+    def _summary_count(self, value: Any) -> int | None:
+        if isinstance(value, (dict, list, tuple, set)):
+            return len(value)
+        return None
+
+    def _sanitize_debug_object(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            sanitized: dict[str, Any] = {}
+            for key, nested in value.items():
+                safe_key = self._sanitize_key_name(key)
+                sanitized[safe_key] = self._sanitize_debug_object(nested)
+            return sanitized
+        if isinstance(value, list):
+            return [self._sanitize_debug_object(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._sanitize_debug_object(item) for item in value]
+        if isinstance(value, str):
+            return self._redact_text(value)
+        return value
+
+    def _sanitize_key_name(self, key: str) -> str:
+        normalized = key.lower().replace("-", "_")
+        if any(fragment in normalized for fragment in SECRET_KEY_FRAGMENTS):
+            return "[REDACTED]"
+        return key
+
+    def _redact_text(self, text: str) -> str:
+        redacted = text
+        for pattern, replacement in SECRET_VALUE_PATTERNS:
+            redacted = pattern.sub(replacement, redacted)
+        return redacted
+
+    def _debug_snapshot(self, exc: Exception | None = None) -> dict[str, Any]:
+        snapshot = self._sanitize_debug_object(self._debug_state or {})
+        if self._debug_last_step:
+            snapshot["last_step"] = self._debug_last_step
+        if exc is not None:
+            snapshot["error_type"] = type(exc).__name__
+            snapshot["error_message"] = self._redact_text(str(exc))
+            formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            snapshot["traceback"] = self._redact_text(formatted[:TRACEBACK_CHAR_LIMIT])
+        return snapshot
+
+    def _with_debug(self, raw_response: dict[str, Any], exc: Exception | None = None) -> dict[str, Any]:
+        if self.debug_enabled:
+            raw_response["debug"] = self._debug_snapshot(exc)
+        return raw_response
 
     def _configuration_error_response(
         self, query: str, missing_variable: str
     ) -> Dict[str, Any]:
+        raw_response = {
+            "status": "configuration_error",
+            "query": query,
+            "missing_variable": missing_variable,
+            "model": self.model,
+            "mcp_server_url": self.mcp_server_url,
+        }
         return {
             "answer": (
                 "Search is not configured correctly right now. Please verify the required "
                 "OpenAI and MCP environment variables and try again."
             ),
             "citations": [],
-            "raw_response": {
-                "status": "configuration_error",
-                "query": query,
-                "missing_variable": missing_variable,
-                "model": self.model,
-                "mcp_server_url": self.mcp_server_url,
-            },
+            "raw_response": self._with_debug(raw_response),
         }
 
     def _error_response(
         self, query: str, status: str, exc: Exception
     ) -> Dict[str, Any]:
+        raw_response = {
+            "status": status,
+            "query": query,
+            "model": self.model,
+            "error_type": type(exc).__name__,
+        }
         return {
             "answer": (
                 "Sorry, I ran into an issue while searching the documentation. Please try "
                 "again in a moment."
             ),
             "citations": [],
-            "raw_response": {
-                "status": status,
-                "query": query,
-                "model": self.model,
-                "error_type": type(exc).__name__,
-            },
+            "raw_response": self._with_debug(raw_response, exc),
         }

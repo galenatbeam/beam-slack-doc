@@ -22,7 +22,9 @@ pip install -r requirements.txt
 export SLACK_SIGNING_SECRET="your-signing-secret"
 export SLACK_BOT_TOKEN="xoxb-your-bot-token"
 export OPENAI_API_KEY="your-openai-key"
-export MCP_AUTH_HEADER="Bearer <your-atlassian-token>"
+export ATLASSIAN_API_EMAIL="you@example.com"
+export ATLASSIAN_API_TOKEN="your-atlassian-api-token"
+export MCP_CLOUD_ID="your-atlassian-cloud-id"
 export CONFLUENCE_SPACE="YOURSPACE"
 export MCP_SERVER_NAME="atlassian-rovo"
 python slack_bot.py
@@ -37,7 +39,11 @@ load it automatically.
 
 Required environment variables:
 
-- `MCP_AUTH_HEADER`
+- Atlassian auth: choose one
+  - `MCP_AUTH_HEADER` (backward-compatible override; full `Authorization` value)
+  - `ATLASSIAN_SERVICE_ACCOUNT_KEY` (`Authorization: Bearer <key>`)
+  - `ATLASSIAN_API_EMAIL` + `ATLASSIAN_API_TOKEN` (`Authorization: Basic <base64(email:api_token)>`, constructed automatically)
+- `MCP_CLOUD_ID` for bot/non-interactive flows so the client pins the intended Atlassian site
 
 OpenAI-hosted mode also requires:
 
@@ -51,13 +57,43 @@ Optional environment variables:
 - `MCP_SERVER_URL` (defaults to `https://mcp.atlassian.com/v1/mcp`)
 - `MCP_SERVER_NAME` (defaults to `atlassian-rovo`)
 
+If `MCP_CLOUD_ID` is omitted, the app falls back to Atlassian resource discovery when a tool accepts `cloudId`, but setting `MCP_CLOUD_ID` is recommended for deterministic bot behavior.
+
+### Atlassian API-token auth
+
+For bot/CI/non-interactive use cases, prefer Atlassian API-token auth instead of OAuth.
+
+Personal API token example:
+
+```bash
+export ATLASSIAN_API_EMAIL="you@example.com"
+export ATLASSIAN_API_TOKEN="your-atlassian-api-token"
+export MCP_CLOUD_ID="your-atlassian-cloud-id"
+```
+
+Service account key example:
+
+```bash
+export ATLASSIAN_SERVICE_ACCOUNT_KEY="your-service-account-key"
+export MCP_CLOUD_ID="your-atlassian-cloud-id"
+```
+
+Backward-compatible manual header override:
+
+```bash
+export MCP_AUTH_HEADER="Bearer <your-atlassian-token>"
+export MCP_CLOUD_ID="your-atlassian-cloud-id"
+```
+
 ### Local LLM mode (Ollama)
 
 To run the CLI against a local OpenAI-compatible Ollama endpoint, set:
 
 ```bash
 export LLM_BASE_URL="http://localhost:11434/v1"
-export MCP_AUTH_HEADER="Bearer <your-atlassian-token>"
+export ATLASSIAN_API_EMAIL="you@example.com"
+export ATLASSIAN_API_TOKEN="your-atlassian-api-token"
+export MCP_CLOUD_ID="your-atlassian-cloud-id"
 ```
 
 In local mode:
@@ -77,6 +113,19 @@ Print the full JSON response instead:
 ```bash
 python cli_search.py --json "What is Beam Benefits?"
 ```
+
+### Troubleshooting AgenticSearch
+
+If a CLI search fails and you need a safe trace, enable debug mode:
+
+```bash
+AGENTIC_SEARCH_DEBUG=1 python cli_search.py --json "What is Beam Benefits?"
+```
+
+When enabled, AgenticSearch writes a redacted MCP trace to stderr and adds
+`raw_response.debug` to the JSON response. The debug payload includes tool names,
+selected strategy, `cloudId`, call argument keys, and response summaries only—no
+content body previews.
 
 ## Slack endpoints
 
