@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 DEFAULT_MCP_SERVER_URL = "https://mcp.atlassian.com/v1/mcp"
+DEFAULT_MCP_SERVER_NAME = "atlassian-rovo"
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_OLLAMA_CHAT_MODEL = "qwen3:4b-instruct"
 LOCAL_LLM_API_KEY_PLACEHOLDER = "ollama"
@@ -32,6 +33,7 @@ MAX_FETCH_RESULTS = 3
 SHARED_SEARCH_TOOL = "search"
 SHARED_FETCH_TOOL = "fetch"
 CONFLUENCE_SEARCH_TOOL = "searchConfluenceUsingCqlSearch"
+CONFLUENCE_SEARCH_TOOL_FALLBACK = "searchConfluenceUsingCql"
 CONFLUENCE_FETCH_TOOL = "getConfluencePage"
 TITLE_KEYS = ("title", "name", "pageTitle")
 URL_KEYS = ("url", "webLink", "link", "pageUrl")
@@ -140,9 +142,7 @@ class AgenticSearch:
             or (LOCAL_LLM_API_KEY_PLACEHOLDER if self.uses_local_llm else "")
         )
         self.confluence_space = confluence_space or os.getenv("CONFLUENCE_SPACE", "")
-        self.mcp_server_name = mcp_server_name or os.getenv(
-            "MCP_SERVER_NAME", "atlassian-rovo"
-        )
+        self.mcp_server_name = mcp_server_name or DEFAULT_MCP_SERVER_NAME
         self.model = self._resolve_model(model)
         self.mcp_server_url = mcp_server_url or os.getenv(
             "MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL
@@ -217,44 +217,20 @@ class AgenticSearch:
 
         self._set_last_step("mcp_connect")
         async with self._build_mcp_server() as server:
-            self._set_last_step("list_tools")
-            tools = await server.list_tools()
-            tool_names = [tool.name for tool in tools]
-            self._record_debug("list_tools", {"tool_names": tool_names})
-            tool_map = {tool.name: tool for tool in tools}
-            strategy = self._select_strategy(tool_map)
-            if strategy is None:
-                raise RuntimeError("No supported Atlassian Rovo search tools were available.")
-            self._record_debug(
-                "strategy",
-                {
-                    "strategy": strategy.name,
-                    "search_tool": strategy.search_tool,
-                    "fetch_tool": strategy.fetch_tool,
-                },
+            self._record_debug("tool_discovery", {"skipped": True})
+            search_arguments = self._build_static_search_arguments(query)
+            search_tool, search_payload = await self._call_static_confluence_search_tool(
+                server, search_arguments
             )
-
-            cloud_id = await self._resolve_cloud_id(server, tool_map, strategy)
-            self._record_debug("cloud_id", {"cloud_id": cloud_id})
-            search_payload = await self._call_tool(
-                server,
-                strategy.search_tool,
-                self._build_search_arguments(
-                    tool_map[strategy.search_tool],
-                    query=query,
-                    cloud_id=cloud_id,
-                    use_cql=strategy.uses_cql,
-                ),
-            )
-            documents = self._normalize_documents(search_payload, source=strategy.search_tool)
+            documents = self._normalize_documents(search_payload, source=search_tool)
 
             if not documents:
                 raw_response = {
                     "status": "no_results",
-                    "strategy": strategy.name,
+                    "strategy": "confluence",
                     "model": self.model,
                     "query": query,
-                    "selected_tools": [strategy.search_tool, strategy.fetch_tool],
+                    "selected_tools": [search_tool],
                 }
                 return {
                     "answer": (
@@ -265,16 +241,6 @@ class AgenticSearch:
                     "raw_response": self._with_debug(raw_response),
                 }
 
-            fetch_errors: list[dict[str, str]] = []
-            if strategy.fetch_tool and strategy.fetch_tool in tool_map:
-                documents = await self._enrich_documents(
-                    server,
-                    tool_map[strategy.fetch_tool],
-                    documents,
-                    cloud_id,
-                    fetch_errors,
-                )
-
             self._set_last_step("synthesis")
             synthesized = await self._synthesize_answer(query, documents)
             citations = self._normalize_citations(synthesized.citations, documents)
@@ -284,11 +250,11 @@ class AgenticSearch:
 
             raw_response = {
                 "status": "ok",
-                "strategy": strategy.name,
+                "strategy": "confluence",
                 "model": self.model,
                 "query": query,
-                "selected_tools": [strategy.search_tool, strategy.fetch_tool],
-                "fetch_errors": fetch_errors,
+                "selected_tools": [search_tool],
+                "fetch_errors": [],
             }
             return {
                 "answer": synthesized.answer.strip(),
@@ -306,6 +272,75 @@ class AgenticSearch:
             },
             cache_tools_list=True,
             max_retry_attempts=2,
+        )
+
+    def _build_static_search_arguments(self, query: str) -> dict[str, Any]:
+        return {
+            "cql": self._build_cql_query(query),
+            "limit": self.max_results,
+            "cloudId": self.atlassian_cloud_id,
+        }
+
+    async def _call_static_confluence_search_tool(
+        self,
+        server: Any,
+        arguments: Mapping[str, Any],
+    ) -> tuple[str, Any]:
+        argument_keys = [key for key in arguments.keys() if not _is_sensitive_debug_key(key)]
+        for index, tool_name in enumerate(
+            (CONFLUENCE_SEARCH_TOOL, CONFLUENCE_SEARCH_TOOL_FALLBACK)
+        ):
+            self._record_debug(
+                "search_tool",
+                {"tool_name": tool_name, "argument_keys": argument_keys},
+            )
+            try:
+                payload = await self._call_tool(server, tool_name, arguments)
+                return tool_name, payload
+            except Exception as exc:
+                if index == 0 and self._is_tool_not_found_error(exc):
+                    continue
+                raise
+
+        raise RuntimeError("No supported static Confluence search tool was available.")
+
+    def _is_tool_not_found_error(self, exc: Exception) -> bool:
+        candidates: list[Any] = [getattr(exc, "error", None), exc]
+        response = getattr(exc, "response", None)
+        if response is not None:
+            candidates.append(self._extract_response_body(response))
+        return any(self._contains_tool_not_found_signal(candidate) for candidate in candidates)
+
+    def _contains_tool_not_found_signal(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, dict):
+            if value.get("code") == -32601:
+                return True
+            return any(
+                self._contains_tool_not_found_signal(value.get(key))
+                for key in ("error", "message", "detail", "data")
+            )
+        if isinstance(value, (list, tuple, set)):
+            return any(self._contains_tool_not_found_signal(item) for item in value)
+        if isinstance(value, str):
+            lowered = value.lower()
+            return any(
+                marker in lowered
+                for marker in ("-32601", "tool not found", "unknown tool", "method not found")
+            )
+
+        if getattr(value, "code", None) == -32601:
+            return True
+
+        nested_error = getattr(value, "error", None)
+        if nested_error is not None and nested_error is not value:
+            if self._contains_tool_not_found_signal(nested_error):
+                return True
+
+        return any(
+            self._contains_tool_not_found_signal(getattr(value, attr, None))
+            for attr in ("message", "detail", "data")
         )
 
     def _select_strategy(self, tool_map: Mapping[str, Any]) -> ToolStrategy | None:
