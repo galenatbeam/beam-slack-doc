@@ -109,6 +109,41 @@ def test_main_allows_local_mode_without_real_openai_api_key(monkeypatch, capsys)
     assert captured.err == ""
 
 
+def test_main_prints_debug_failure_summary_to_stderr_without_json(monkeypatch, capsys):
+    class FakeSearch:
+        def __init__(self):
+            self.openai_api_key = "test-openai-key"
+            self.mcp_auth_header = "Bearer test-token"
+
+        def search(self, query: str):
+            assert query == "query"
+            return {
+                "answer": "Sorry, search failed.",
+                "citations": [],
+                "raw_response": {
+                    "status": "search_error",
+                    "debug": {
+                        "last_step": "list_tools",
+                        "error_type": "RuntimeError",
+                        "error_message": "boom",
+                        "http_status": 403,
+                    },
+                },
+            }
+
+    monkeypatch.setattr(cli_search, "load_dotenv", lambda: None)
+    monkeypatch.setattr(cli_search, "AgenticSearch", FakeSearch)
+
+    exit_code = cli_search.main(["query"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Sorry, search failed." in captured.out
+    assert "[AgenticSearch debug] result:" in captured.err
+    assert '"last_step": "list_tools"' in captured.err
+    assert '"error_message": "boom"' in captured.err
+
+
 def test_parser_uses_exit_code_two_for_invalid_usage():
     with pytest.raises(SystemExit) as excinfo:
         cli_search.main([])

@@ -18,10 +18,11 @@ from agentic_search import (
 
 
 class FakeServer:
-    def __init__(self, tools, responses=None, error=None):
+    def __init__(self, tools, responses=None, error=None, list_tools_error=None):
         self.tools = tools
         self.responses = responses or {}
         self.error = error
+        self.list_tools_error = list_tools_error
         self.calls = []
 
     async def __aenter__(self):
@@ -31,6 +32,8 @@ class FakeServer:
         return False
 
     async def list_tools(self):
+        if self.list_tools_error:
+            raise self.list_tools_error
         return self.tools
 
     async def call_tool(self, tool_name, arguments):
@@ -492,7 +495,44 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
     assert debug["calls"][0]["response_summary"]["top_level_keys"] == ["results", "[REDACTED]"]
 
 
-def test_search_debug_error_path_includes_last_step_and_error_message(monkeypatch):
+def test_search_debug_list_tools_failure_prints_stderr_error_line(monkeypatch, capsys):
+    monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
+    error = RuntimeError("list_tools failed Authorization=Bearer secret-token")
+    error.response = SimpleNamespace(
+        status_code=403,
+        json=lambda: {
+            "error": {
+                "code": 403,
+                "message": "Forbidden Basic abc123",
+                "data": {"api_token": "top-secret", "detail": "invalid cloudId"},
+            }
+        },
+    )
+    server = FakeServer(tools=[], list_tools_error=error)
+    search = make_search()
+
+    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+        result = search.search("What failed?")
+
+    captured = capsys.readouterr()
+    debug = result["raw_response"]["debug"]
+    serialized = json.dumps(debug).lower()
+    assert result["raw_response"]["status"] == "search_error"
+    assert debug["last_step"] == "list_tools"
+    assert debug["http_status"] == 403
+    assert debug["mcp_error_preview"]["code"] == 403
+    assert "list_tools failed" in debug["error_message"]
+    assert "Forbidden" in debug["mcp_error_preview"]["message"]
+    assert "[AgenticSearch debug] error:" in captured.err
+    assert '"error_message": "list_tools failed' in captured.err
+    assert "secret-token" not in captured.err
+    assert "abc123" not in captured.err
+    assert "top-secret" not in captured.err
+    assert "authorization" not in serialized
+    assert "api_token" not in serialized
+
+
+def test_search_debug_call_tool_failure_prints_stderr_error_line(monkeypatch, capsys):
     monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
     server = FakeServer(
         tools=[make_tool("search", {"query": {"type": "string"}}, ["query"])],
@@ -503,6 +543,7 @@ def test_search_debug_error_path_includes_last_step_and_error_message(monkeypatc
     with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
         result = search.search("What failed?")
 
+    captured = capsys.readouterr()
     debug = result["raw_response"]["debug"]
     serialized = json.dumps(debug).lower()
     assert result["raw_response"]["status"] == "search_error"
@@ -510,8 +551,42 @@ def test_search_debug_error_path_includes_last_step_and_error_message(monkeypatc
     assert debug["error_type"] == "RuntimeError"
     assert "boom" in debug["error_message"]
     assert "traceback" in debug
+    assert '"error_message": "boom [REDACTED_SECRET]"' in captured.err
+    assert "[AgenticSearch debug] call_tool:" in captured.err
+    assert "[AgenticSearch debug] error:" in captured.err
+    assert "secret-token" not in captured.err
     assert "bearer" not in serialized
     assert "authorization" not in serialized
+
+
+def test_debug_response_summary_includes_redacted_error_text_for_error_payload(monkeypatch):
+    monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
+    server = FakeServer(
+        tools=[make_tool("search", {"query": {"type": "string"}}, ["query"])],
+        responses={
+            "search": SimpleNamespace(
+                isError=True,
+                structuredContent={
+                    "message": "Bad request Authorization=Bearer hidden-token",
+                    "data": {"api_token": "hidden-token"},
+                },
+                content=[],
+            )
+        },
+    )
+    search = make_search()
+
+    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+        result = search.search("debug me")
+
+    summary = result["raw_response"]["debug"]["calls"][0]["response_summary"]
+    serialized = json.dumps(summary).lower()
+    assert result["raw_response"]["status"] == "no_results"
+    assert summary["is_error"] is True
+    assert "Bad request" in summary["error_text"]
+    assert "hidden-token" not in serialized
+    assert "authorization" not in serialized
+    assert "api_token" not in serialized
 
 
 def test_local_mode_configures_async_openai_client_and_chat_completions_api():

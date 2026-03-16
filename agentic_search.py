@@ -49,6 +49,7 @@ ATLASSIAN_AUTH_CONFIG = (
 DEBUG_ENV_VAR = "AGENTIC_SEARCH_DEBUG"
 DEBUG_TRUE_VALUES = {"1", "true", "yes"}
 TRACEBACK_CHAR_LIMIT = 2000
+ERROR_PREVIEW_CHAR_LIMIT = 300
 SECRET_KEY_FRAGMENTS = (
     "auth",
     "authorization",
@@ -231,6 +232,7 @@ class AgenticSearch:
     async def _search_async(self, query: str) -> Dict[str, Any]:
         self._configure_agents_sdk()
 
+        self._set_last_step("mcp_connect")
         async with self._build_mcp_server() as server:
             self._set_last_step("list_tools")
             tools = await server.list_tools()
@@ -767,6 +769,7 @@ class AgenticSearch:
             payload = await server.call_tool(tool_name, dict(arguments))
         except Exception as exc:
             call_debug["error_type"] = type(exc).__name__
+            call_debug["error_message"] = self._preview_text(str(exc))
             self._record_call_debug(call_debug)
             raise
 
@@ -821,9 +824,21 @@ class AgenticSearch:
             file=sys.stderr,
         )
 
+    def _record_error_debug(self, error_summary: Mapping[str, Any]) -> None:
+        if not self.debug_enabled:
+            return
+        sanitized = self._sanitize_debug_object(dict(error_summary))
+        print(
+            f"[AgenticSearch debug] error: {json.dumps(sanitized, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+
     def _summarize_payload(self, payload: Any) -> dict[str, Any]:
         extracted = self._extract_payload(payload)
         summary: dict[str, Any] = {"payload_type": type(extracted).__name__}
+        is_error = bool(getattr(payload, "isError", False))
+        if isinstance(extracted, dict) and extracted.get("isError") is True:
+            is_error = True
         if isinstance(extracted, dict):
             keys: list[str] = []
             counts: dict[str, int] = {}
@@ -836,12 +851,17 @@ class AgenticSearch:
             summary["top_level_keys"] = keys
             if counts:
                 summary["counts"] = counts
-            return summary
-        if isinstance(extracted, list):
+        elif isinstance(extracted, list):
             summary["top_level_keys"] = []
             summary["counts"] = {"items": len(extracted)}
-            return summary
-        summary["top_level_keys"] = []
+        else:
+            summary["top_level_keys"] = []
+
+        if is_error:
+            summary["is_error"] = True
+            error_text = self._extract_payload_error_text(payload, extracted)
+            if error_text:
+                summary["error_text"] = error_text
         return summary
 
     def _summary_count(self, value: Any) -> int | None:
@@ -854,7 +874,10 @@ class AgenticSearch:
             sanitized: dict[str, Any] = {}
             for key, nested in value.items():
                 safe_key = self._sanitize_key_name(key)
-                sanitized[safe_key] = self._sanitize_debug_object(nested)
+                if safe_key == "[REDACTED]":
+                    sanitized[safe_key] = "[REDACTED]"
+                else:
+                    sanitized[safe_key] = self._sanitize_debug_object(nested)
             return sanitized
         if isinstance(value, list):
             return [self._sanitize_debug_object(item) for item in value]
@@ -876,20 +899,162 @@ class AgenticSearch:
             redacted = pattern.sub(replacement, redacted)
         return redacted
 
+    def _truncate_text(self, text: str, limit: int = ERROR_PREVIEW_CHAR_LIMIT) -> str:
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    def _preview_text(self, text: str) -> str:
+        return self._truncate_text(self._redact_text(text))
+
+    def _preview_debug_value(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        sanitized = self._sanitize_debug_object(value)
+        if isinstance(sanitized, str):
+            return self._truncate_text(sanitized)
+        serialized = json.dumps(sanitized, ensure_ascii=False)
+        return self._truncate_text(serialized)
+
+    def _extract_payload_error_text(self, payload: Any, extracted: Any) -> str | None:
+        text = self._error_text_from_value(extracted)
+        if text:
+            return text
+
+        for item in getattr(payload, "content", []) or []:
+            if getattr(item, "type", None) == "text":
+                text = self._preview_text(getattr(item, "text", ""))
+                if text:
+                    return text
+        return None
+
+    def _error_text_from_value(self, value: Any) -> str | None:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return self._preview_text(stripped) if stripped else None
+        if isinstance(value, dict):
+            for key in ("message", "detail", "details", "error", "reason"):
+                nested = value.get(key)
+                text = self._error_text_from_value(nested)
+                if text:
+                    return text
+        if isinstance(value, list):
+            for item in value:
+                text = self._error_text_from_value(item)
+                if text:
+                    return text
+        return None
+
+    def _extract_exception_debug_details(self, exc: Exception) -> dict[str, Any]:
+        details: dict[str, Any] = {}
+        response = getattr(exc, "response", None)
+        response_body = None
+        if response is not None:
+            status_code = getattr(response, "status_code", None)
+            if status_code is not None:
+                details["http_status"] = status_code
+            response_body = self._extract_response_body(response)
+            response_preview = self._preview_debug_value(response_body)
+            if response_preview:
+                details["http_response_preview"] = response_preview
+
+        mcp_error_preview = self._build_mcp_error_preview(getattr(exc, "error", None))
+        if not mcp_error_preview:
+            mcp_error_preview = self._build_mcp_error_preview(exc)
+        if not mcp_error_preview:
+            mcp_error_preview = self._build_mcp_error_preview(response_body)
+        if mcp_error_preview:
+            details["mcp_error_preview"] = mcp_error_preview
+        return details
+
+    def _extract_response_body(self, response: Any) -> Any:
+        try:
+            return response.json()
+        except Exception:
+            pass
+
+        try:
+            text = getattr(response, "text", None)
+        except Exception:
+            text = None
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        try:
+            content = getattr(response, "content", None)
+        except Exception:
+            content = None
+        if isinstance(content, bytes):
+            decoded = content.decode("utf-8", errors="replace").strip()
+            return decoded or None
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        return None
+
+    def _build_mcp_error_preview(self, value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+
+        if isinstance(value, dict):
+            nested_error = value.get("error")
+            if nested_error is not None:
+                nested_preview = self._build_mcp_error_preview(nested_error)
+                if nested_preview:
+                    return nested_preview
+            code = value.get("code")
+            message = value.get("message")
+            data = value.get("data")
+        else:
+            nested_error = getattr(value, "error", None)
+            if nested_error is not None and nested_error is not value:
+                nested_preview = self._build_mcp_error_preview(nested_error)
+                if nested_preview:
+                    return nested_preview
+            code = getattr(value, "code", None)
+            message = getattr(value, "message", None)
+            data = getattr(value, "data", None)
+
+        preview: dict[str, Any] = {}
+        if code is not None:
+            preview["code"] = code
+        if message not in (None, ""):
+            preview["message"] = self._preview_debug_value(message)
+        if data not in (None, ""):
+            preview["data"] = self._preview_debug_value(data)
+        return preview or None
+
+    def _error_summary_from_snapshot(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            key: snapshot[key]
+            for key in (
+                "last_step",
+                "error_type",
+                "error_message",
+                "http_status",
+                "http_response_preview",
+                "mcp_error_preview",
+            )
+            if key in snapshot
+        }
+
     def _debug_snapshot(self, exc: Exception | None = None) -> dict[str, Any]:
         snapshot = self._sanitize_debug_object(self._debug_state or {})
         if self._debug_last_step:
             snapshot["last_step"] = self._debug_last_step
         if exc is not None:
             snapshot["error_type"] = type(exc).__name__
-            snapshot["error_message"] = self._redact_text(str(exc))
+            snapshot["error_message"] = self._preview_text(str(exc))
+            snapshot.update(self._extract_exception_debug_details(exc))
             formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             snapshot["traceback"] = self._redact_text(formatted[:TRACEBACK_CHAR_LIMIT])
         return snapshot
 
     def _with_debug(self, raw_response: dict[str, Any], exc: Exception | None = None) -> dict[str, Any]:
         if self.debug_enabled:
-            raw_response["debug"] = self._debug_snapshot(exc)
+            debug_snapshot = self._debug_snapshot(exc)
+            raw_response["debug"] = debug_snapshot
+            if exc is not None:
+                self._record_error_debug(self._error_summary_from_snapshot(debug_snapshot))
         return raw_response
 
     def _configuration_error_response(

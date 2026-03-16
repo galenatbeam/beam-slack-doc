@@ -63,6 +63,33 @@ def _print_default_output(result: dict) -> None:
         print(f"- {title}: {url}")
 
 
+def _print_failure_debug(result: dict) -> None:
+    raw_response = result.get("raw_response", {}) or {}
+    debug = raw_response.get("debug")
+    status = raw_response.get("status", "")
+    if not debug or not isinstance(debug, dict) or not status.endswith("error"):
+        return
+
+    summary = {
+        key: debug[key]
+        for key in (
+            "last_step",
+            "error_type",
+            "error_message",
+            "http_status",
+            "http_response_preview",
+            "mcp_error_preview",
+        )
+        if key in debug
+    }
+    if not summary:
+        summary = debug
+    print(
+        f"[AgenticSearch debug] result: {json.dumps(summary, ensure_ascii=False)}",
+        file=sys.stderr,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     load_dotenv()
@@ -82,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         _print_default_output(result)
+        _print_failure_debug(result)
     return 0
 
 
