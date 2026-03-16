@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -38,6 +39,35 @@ EXCERPT_KEYS = ("excerpt", "snippet", "summary", "text")
 ID_KEYS = ("id", "pageId", "contentId", "entityId")
 ARI_KEYS = ("ari", "resourceAri", "resourceARI", "resourceId")
 CONTENT_KEYS = ("body", "content", "markdown", "value")
+ATLASSIAN_AUTH_CONFIG = (
+    "MCP_AUTH_HEADER or ATLASSIAN_SERVICE_ACCOUNT_KEY or "
+    "ATLASSIAN_API_EMAIL + ATLASSIAN_API_TOKEN"
+)
+
+
+def build_mcp_auth_header(
+    explicit_header: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Build the Atlassian MCP Authorization header from supported config sources."""
+    resolved_env = env or os.environ
+    header = (explicit_header or "").strip() or resolved_env.get("MCP_AUTH_HEADER", "").strip()
+    if header:
+        return header
+
+    service_account_key = resolved_env.get("ATLASSIAN_SERVICE_ACCOUNT_KEY", "").strip()
+    if service_account_key:
+        return f"Bearer {service_account_key}"
+
+    api_email = resolved_env.get("ATLASSIAN_API_EMAIL", "").strip()
+    api_token = resolved_env.get("ATLASSIAN_API_TOKEN", "").strip()
+    if api_email and api_token:
+        encoded_credentials = base64.b64encode(
+            f"{api_email}:{api_token}".encode("utf-8")
+        ).decode("ascii")
+        return f"Basic {encoded_credentials}"
+
+    return ""
 
 
 class Citation(BaseModel):
@@ -90,6 +120,7 @@ class AgenticSearch:
         llm_base_url: str | None = None,
         mcp_server_url: str | None = None,
         mcp_auth_header: str | None = None,
+        mcp_cloud_id: str | None = None,
         max_results: int = 5,
     ) -> None:
         self.llm_base_url = (llm_base_url or os.getenv("LLM_BASE_URL", "")).strip()
@@ -107,7 +138,8 @@ class AgenticSearch:
         self.mcp_server_url = mcp_server_url or os.getenv(
             "MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL
         )
-        self.mcp_auth_header = mcp_auth_header or os.getenv("MCP_AUTH_HEADER", "")
+        self.mcp_auth_header = build_mcp_auth_header(mcp_auth_header)
+        self.mcp_cloud_id = (mcp_cloud_id or os.getenv("MCP_CLOUD_ID", "")).strip()
         self.max_results = max(1, max_results)
 
     @property
@@ -132,7 +164,7 @@ class AgenticSearch:
             return self._configuration_error_response(clean_query, "OPENAI_API_KEY")
 
         if not self.mcp_auth_header:
-            return self._configuration_error_response(clean_query, "MCP_AUTH_HEADER")
+            return self._configuration_error_response(clean_query, ATLASSIAN_AUTH_CONFIG)
 
         try:
             return asyncio.run(self._search_async(clean_query))
@@ -267,11 +299,14 @@ class AgenticSearch:
         if not any(self._tool_accepts_param(tool, "cloudId") for tool in selected_tools):
             return None
 
+        if self.mcp_cloud_id:
+            return self.mcp_cloud_id
+
         if ACCESSIBLE_RESOURCES_TOOL not in tool_map:
             return None
 
         resources_payload = await server.call_tool(ACCESSIBLE_RESOURCES_TOOL, {})
-        for resource in self._iter_candidate_dicts(self._extract_payload(resources_payload)):
+        for resource in self._iter_nested_dicts(self._extract_payload(resources_payload)):
             cloud_id = self._first_string(resource, ("cloudId",))
             if cloud_id:
                 return cloud_id
@@ -582,6 +617,15 @@ class AgenticSearch:
         elif isinstance(value, list):
             for item in value:
                 yield from self._iter_candidate_dicts(item)
+
+    def _iter_nested_dicts(self, value: Any):
+        if isinstance(value, dict):
+            yield value
+            for nested in value.values():
+                yield from self._iter_nested_dicts(nested)
+        elif isinstance(value, list):
+            for item in value:
+                yield from self._iter_nested_dicts(item)
 
     def _extract_text_blob(self, value: Any) -> str | None:
         if isinstance(value, str):
