@@ -8,15 +8,24 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Mapping, Sequence
 
-from agents import Agent, Runner, set_default_openai_key
+from agents import (
+    Agent,
+    Runner,
+    set_default_openai_api,
+    set_default_openai_client,
+    set_tracing_disabled,
+)
 from agents.mcp import MCPServerStreamableHttp
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
 DEFAULT_MCP_SERVER_URL = "https://mcp.atlassian.com/v1/mcp"
 DEFAULT_MODEL = "gpt-4.1-mini"
+DEFAULT_OLLAMA_CHAT_MODEL = "qwen3:4b-instruct"
+LOCAL_LLM_API_KEY_PLACEHOLDER = "ollama"
 MAX_FETCH_RESULTS = 3
 SHARED_SEARCH_TOOL = "search"
 SHARED_FETCH_TOOL = "fetch"
@@ -78,21 +87,32 @@ class AgenticSearch:
         confluence_space: str | None = None,
         mcp_server_name: str | None = None,
         model: str | None = None,
+        llm_base_url: str | None = None,
         mcp_server_url: str | None = None,
         mcp_auth_header: str | None = None,
         max_results: int = 5,
     ) -> None:
-        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY", "")
+        self.llm_base_url = (llm_base_url or os.getenv("LLM_BASE_URL", "")).strip()
+        env_openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        self.openai_api_key = (
+            openai_api_key
+            or env_openai_api_key
+            or (LOCAL_LLM_API_KEY_PLACEHOLDER if self.uses_local_llm else "")
+        )
         self.confluence_space = confluence_space or os.getenv("CONFLUENCE_SPACE", "")
         self.mcp_server_name = mcp_server_name or os.getenv(
             "MCP_SERVER_NAME", "atlassian-rovo"
         )
-        self.model = model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+        self.model = self._resolve_model(model)
         self.mcp_server_url = mcp_server_url or os.getenv(
             "MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL
         )
         self.mcp_auth_header = mcp_auth_header or os.getenv("MCP_AUTH_HEADER", "")
         self.max_results = max(1, max_results)
+
+    @property
+    def uses_local_llm(self) -> bool:
+        return bool(self.llm_base_url)
 
     def search(self, query: str) -> Dict[str, Any]:
         """Search documentation and return a structured answer with citations."""
@@ -108,7 +128,7 @@ class AgenticSearch:
                 },
             }
 
-        if not self.openai_api_key:
+        if not self.uses_local_llm and not self.openai_api_key:
             return self._configuration_error_response(clean_query, "OPENAI_API_KEY")
 
         if not self.mcp_auth_header:
@@ -133,7 +153,7 @@ class AgenticSearch:
         )
 
     async def _search_async(self, query: str) -> Dict[str, Any]:
-        set_default_openai_key(self.openai_api_key, use_for_tracing=False)
+        self._configure_agents_sdk()
 
         async with self._build_mcp_server() as server:
             tools = await server.list_tools()
@@ -361,12 +381,6 @@ class AgenticSearch:
     async def _synthesize_answer(
         self, query: str, documents: Sequence[DocumentResult]
     ) -> SynthesizedAnswer:
-        agent = Agent(
-            name="Doc Search Synthesizer",
-            instructions=self.build_agent_instructions(),
-            model=self.model,
-            output_type=SynthesizedAnswer,
-        )
         prompt = json.dumps(
             {
                 "query": query,
@@ -374,8 +388,72 @@ class AgenticSearch:
             },
             ensure_ascii=False,
         )
+
+        try:
+            return await self._run_structured_synthesis(prompt)
+        except Exception:
+            if not self.uses_local_llm:
+                raise
+            return await self._run_plain_text_synthesis(prompt, documents)
+
+    async def _run_structured_synthesis(self, prompt: str) -> SynthesizedAnswer:
+        agent = Agent(
+            name="Doc Search Synthesizer",
+            instructions=self.build_agent_instructions(),
+            model=self.model,
+            output_type=SynthesizedAnswer,
+        )
         result = await Runner.run(agent, prompt)
         return result.final_output_as(SynthesizedAnswer, raise_if_incorrect_type=True)
+
+    async def _run_plain_text_synthesis(
+        self,
+        prompt: str,
+        documents: Sequence[DocumentResult],
+    ) -> SynthesizedAnswer:
+        agent = Agent(
+            name="Doc Search Synthesizer",
+            instructions=(
+                self.build_agent_instructions()
+                + " Return a concise plain-text answer only. Do not emit JSON or XML."
+            ),
+            model=self.model,
+        )
+        result = await Runner.run(agent, prompt)
+        answer = getattr(result, "final_output", None)
+        answer_text = answer if isinstance(answer, str) else str(answer or "")
+        answer_text = answer_text.strip()
+        if not answer_text:
+            answer_text = (
+                "I found relevant documentation, but the local model did not return a usable "
+                "structured answer."
+            )
+        return SynthesizedAnswer(
+            answer=answer_text,
+            citations=self._fallback_citations(documents),
+        )
+
+    def _configure_agents_sdk(self) -> None:
+        client_kwargs: dict[str, Any] = {"api_key": self.openai_api_key}
+        if self.uses_local_llm:
+            client_kwargs["base_url"] = self.llm_base_url
+
+        set_default_openai_client(
+            AsyncOpenAI(**client_kwargs),
+            use_for_tracing=not self.uses_local_llm,
+        )
+        set_default_openai_api(
+            "chat_completions" if self.uses_local_llm else "responses"
+        )
+        set_tracing_disabled(self.uses_local_llm)
+
+    def _resolve_model(self, explicit_model: str | None) -> str:
+        requested_model = explicit_model or os.getenv("OPENAI_MODEL", "")
+        if requested_model:
+            return requested_model
+        if self.uses_local_llm:
+            return DEFAULT_OLLAMA_CHAT_MODEL
+        return DEFAULT_MODEL
 
     def _normalize_documents(self, payload: Any, source: str) -> list[DocumentResult]:
         extracted = self._extract_payload(payload)
