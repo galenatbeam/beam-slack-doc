@@ -894,10 +894,25 @@ class AgenticSearch:
         return key
 
     def _redact_text(self, text: str) -> str:
+        sanitized_json = self._sanitize_json_text(text)
+        if sanitized_json is not None:
+            return sanitized_json
+
         redacted = text
         for pattern, replacement in SECRET_VALUE_PATTERNS:
             redacted = pattern.sub(replacement, redacted)
         return redacted
+
+    def _sanitize_json_text(self, text: str) -> str | None:
+        stripped = text.strip()
+        if not stripped or stripped[0] not in "[{":
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        sanitized = self._sanitize_debug_object(parsed)
+        return json.dumps(sanitized, ensure_ascii=False)
 
     def _truncate_text(self, text: str, limit: int = ERROR_PREVIEW_CHAR_LIMIT) -> str:
         if len(text) <= limit:

@@ -532,6 +532,41 @@ def test_search_debug_list_tools_failure_prints_stderr_error_line(monkeypatch, c
     assert "api_token" not in serialized
 
 
+def test_search_debug_redacts_json_string_http_response_body(monkeypatch, capsys):
+    monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
+    error = RuntimeError("list_tools failed")
+    error.response = SimpleNamespace(
+        status_code=403,
+        text='{"api_token":"top-secret","Authorization":"Bearer secret-token","mode":"Basic abc123"}',
+    )
+    server = FakeServer(tools=[], list_tools_error=error)
+    search = make_search()
+
+    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+        result = search.search("What failed?")
+
+    captured = capsys.readouterr()
+    debug = result["raw_response"]["debug"]
+    preview = debug["http_response_preview"]
+    serialized = json.dumps(debug).lower()
+    assert result["raw_response"]["status"] == "search_error"
+    assert debug["http_status"] == 403
+    assert '"[REDACTED]": "[REDACTED]"' in preview
+    assert '"mode": "[REDACTED_AUTH]"' in preview
+    assert "top-secret" not in preview
+    assert "secret-token" not in preview
+    assert "Authorization" not in preview
+    assert "Bearer" not in preview
+    assert "Basic" not in preview
+    assert "top-secret" not in captured.err
+    assert "secret-token" not in captured.err
+    assert "Authorization" not in captured.err
+    assert "Bearer" not in captured.err
+    assert "Basic abc123" not in captured.err
+    assert "authorization" not in serialized
+    assert "api_token" not in serialized
+
+
 def test_search_debug_call_tool_failure_prints_stderr_error_line(monkeypatch, capsys):
     monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
     server = FakeServer(
