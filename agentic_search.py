@@ -32,8 +32,7 @@ LOCAL_LLM_API_KEY_PLACEHOLDER = "ollama"
 MAX_FETCH_RESULTS = 3
 SHARED_SEARCH_TOOL = "search"
 SHARED_FETCH_TOOL = "fetch"
-CONFLUENCE_SEARCH_TOOL = "searchConfluenceUsingCqlSearch"
-CONFLUENCE_SEARCH_TOOL_FALLBACK = "searchConfluenceUsingCql"
+CONFLUENCE_SEARCH_TOOL = "searchConfluenceUsingCql"
 CONFLUENCE_FETCH_TOOL = "getConfluencePage"
 TITLE_KEYS = ("title", "name", "pageTitle")
 URL_KEYS = ("url", "webLink", "link", "pageUrl")
@@ -85,8 +84,10 @@ class Citation(BaseModel):
     """Citation returned to callers."""
 
     title: str
-    url: str
+    url: str | None = None
     excerpt: str | None = None
+    identifier: str | None = None
+    ari: str | None = None
 
 
 class SynthesizedAnswer(BaseModel):
@@ -209,7 +210,8 @@ class AgenticSearch:
             "You are a documentation search assistant. You are given documentation that was "
             "already retrieved through MCP tools. Answer only from the provided documents. "
             "Keep the answer concise, say clearly when the docs do not fully answer the query, "
-            "and cite only documents that were provided using title + URL." + scope
+            "and cite only provided documents using title + URL when available, otherwise "
+            "title + ARI/ID." + scope
         )
 
     async def _search_async(self, query: str) -> Dict[str, Any]:
@@ -217,17 +219,20 @@ class AgenticSearch:
 
         self._set_last_step("mcp_connect")
         async with self._build_mcp_server() as server:
-            self._record_debug("tool_discovery", {"skipped": True})
-            search_arguments = self._build_static_search_arguments(query)
-            search_tool, search_payload = await self._call_static_confluence_search_tool(
-                server, search_arguments
+            self._record_debug(
+                "tool_discovery",
+                {"skipped": True, "method": "list_tools"},
+            )
+            search_tool, search_payload = await self._call_shared_search_tool(
+                server,
+                self._build_shared_search_argument_candidates(query),
             )
             documents = self._normalize_documents(search_payload, source=search_tool)
 
             if not documents:
                 raw_response = {
                     "status": "no_results",
-                    "strategy": "confluence",
+                    "strategy": "shared_search",
                     "model": self.model,
                     "query": query,
                     "selected_tools": [search_tool],
@@ -250,7 +255,7 @@ class AgenticSearch:
 
             raw_response = {
                 "status": "ok",
-                "strategy": "confluence",
+                "strategy": "shared_search",
                 "model": self.model,
                 "query": query,
                 "selected_tools": [search_tool],
@@ -270,39 +275,105 @@ class AgenticSearch:
                 "headers": {"Authorization": self.mcp_auth_header},
                 "timeout": 10,
             },
-            cache_tools_list=True,
+            cache_tools_list=False,
             max_retry_attempts=2,
         )
 
-    def _build_static_search_arguments(self, query: str) -> dict[str, Any]:
-        return {
-            "cql": self._build_cql_query(query),
-            "limit": self.max_results,
-            "cloudId": self.atlassian_cloud_id,
-        }
+    def _build_natural_language_query(self, query: str) -> str:
+        if not self.confluence_space:
+            return query
+        return f"{query}\n\nPrefer results from Confluence space '{self.confluence_space}' when relevant."
 
-    async def _call_static_confluence_search_tool(
+    def _build_shared_search_argument_candidates(self, query: str) -> list[dict[str, Any]]:
+        base_arguments = {"query": self._build_natural_language_query(query)}
+        candidates: list[dict[str, Any]] = [dict(base_arguments)]
+
+        with_limit = {**base_arguments, "max_results": self.max_results}
+        candidates.insert(0, with_limit)
+
+        if self.atlassian_cloud_id:
+            candidates.insert(0, {**with_limit, "cloudId": self.atlassian_cloud_id})
+            candidates.insert(2, {**base_arguments, "cloudId": self.atlassian_cloud_id})
+
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[tuple[str, Any], ...]] = set()
+        for candidate in candidates:
+            fingerprint = tuple(candidate.items())
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            deduped.append(candidate)
+        return deduped
+
+    async def _call_shared_search_tool(
         self,
         server: Any,
-        arguments: Mapping[str, Any],
+        argument_candidates: Sequence[Mapping[str, Any]],
     ) -> tuple[str, Any]:
-        argument_keys = [key for key in arguments.keys() if not _is_sensitive_debug_key(key)]
-        for index, tool_name in enumerate(
-            (CONFLUENCE_SEARCH_TOOL, CONFLUENCE_SEARCH_TOOL_FALLBACK)
-        ):
+        for index, arguments in enumerate(argument_candidates):
+            argument_keys = [key for key in arguments.keys() if not _is_sensitive_debug_key(key)]
             self._record_debug(
                 "search_tool",
-                {"tool_name": tool_name, "argument_keys": argument_keys},
+                {"tool_name": SHARED_SEARCH_TOOL, "argument_keys": argument_keys},
             )
             try:
-                payload = await self._call_tool(server, tool_name, arguments)
-                return tool_name, payload
+                payload = await self._call_tool(server, SHARED_SEARCH_TOOL, arguments)
+                return SHARED_SEARCH_TOOL, payload
             except Exception as exc:
-                if index == 0 and self._is_tool_not_found_error(exc):
+                if index < len(argument_candidates) - 1 and self._is_tool_argument_error(exc):
                     continue
                 raise
 
-        raise RuntimeError("No supported static Confluence search tool was available.")
+        raise RuntimeError("No supported shared search argument shape was accepted.")
+
+    def _is_tool_argument_error(self, exc: Exception) -> bool:
+        candidates: list[Any] = [getattr(exc, "error", None), exc]
+        response = getattr(exc, "response", None)
+        if response is not None:
+            candidates.append(self._extract_response_body(response))
+        return any(self._contains_invalid_argument_signal(candidate) for candidate in candidates)
+
+    def _contains_invalid_argument_signal(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, dict):
+            if value.get("code") == -32602:
+                return True
+            return any(
+                self._contains_invalid_argument_signal(value.get(key))
+                for key in ("error", "message", "detail", "data")
+            )
+        if isinstance(value, (list, tuple, set)):
+            return any(self._contains_invalid_argument_signal(item) for item in value)
+        if isinstance(value, str):
+            lowered = value.lower()
+            return any(
+                marker in lowered
+                for marker in (
+                    "-32602",
+                    "invalid params",
+                    "invalid arguments",
+                    "validation",
+                    "unexpected property",
+                    "additional properties",
+                    "unknown argument",
+                    "unknown parameter",
+                    "unexpected key",
+                )
+            )
+
+        if getattr(value, "code", None) == -32602:
+            return True
+
+        nested_error = getattr(value, "error", None)
+        if nested_error is not None and nested_error is not value:
+            if self._contains_invalid_argument_signal(nested_error):
+                return True
+
+        return any(
+            self._contains_invalid_argument_signal(getattr(value, attr, None))
+            for attr in ("message", "detail", "data")
+        )
 
     def _is_tool_not_found_error(self, exc: Exception) -> bool:
         candidates: list[Any] = [getattr(exc, "error", None), exc]
@@ -564,13 +635,16 @@ class AgenticSearch:
         documents: list[DocumentResult] = []
         seen: set[str] = set()
         for candidate in candidates:
-            title = self._first_string(candidate, TITLE_KEYS) or self._first_string(
-                candidate, EXCERPT_KEYS
+            identifier = self._first_string(candidate, ID_KEYS)
+            ari = self._first_string(candidate, ARI_KEYS)
+            title = (
+                self._first_string(candidate, TITLE_KEYS)
+                or identifier
+                or ari
+                or self._first_string(candidate, EXCERPT_KEYS)
             )
             url = self._first_string(candidate, URL_KEYS)
             excerpt = self._first_string(candidate, EXCERPT_KEYS)
-            identifier = self._first_string(candidate, ID_KEYS)
-            ari = self._first_string(candidate, ARI_KEYS)
             content = self._extract_text_blob(candidate)
             if content == excerpt:
                 content = None
@@ -607,9 +681,12 @@ class AgenticSearch:
         for citation in citations:
             document = by_title.get(citation.title)
             url = citation.url or (document.url if document else None)
-            if not citation.title or not url:
+            identifier = citation.identifier or (document.identifier if document else None)
+            ari = citation.ari or (document.ari if document else None)
+            reference = url or ari or identifier
+            if not citation.title or not reference:
                 continue
-            key = (citation.title, url)
+            key = (citation.title, reference)
             if key in seen:
                 continue
             seen.add(key)
@@ -618,6 +695,8 @@ class AgenticSearch:
                     title=citation.title,
                     url=url,
                     excerpt=citation.excerpt or (document.excerpt if document else None),
+                    identifier=identifier,
+                    ari=ari,
                 )
             )
         return normalized
@@ -625,12 +704,14 @@ class AgenticSearch:
     def _fallback_citations(self, documents: Sequence[DocumentResult]) -> list[Citation]:
         citations: list[Citation] = []
         for document in documents:
-            if document.url:
+            if document.url or document.ari or document.identifier:
                 citations.append(
                     Citation(
                         title=document.title,
                         url=document.url,
                         excerpt=document.excerpt,
+                        identifier=document.identifier,
+                        ari=document.ari,
                     )
                 )
         return citations[:MAX_FETCH_RESULTS]
