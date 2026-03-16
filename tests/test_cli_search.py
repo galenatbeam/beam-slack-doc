@@ -11,7 +11,8 @@ def test_main_prints_answer_and_citations(monkeypatch, capsys):
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = "test-openai-key"
-            self.mcp_auth_header = "Bearer test-token"
+            self.confluence_mcp_api_key = "test-token"
+            self.atlassian_cloud_id = "test-cloud-id"
 
         def search(self, query: str):
             assert query == "What is Beam Benefits?"
@@ -48,7 +49,8 @@ def test_main_prints_json_when_requested(monkeypatch, capsys):
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = "test-openai-key"
-            self.mcp_auth_header = "Bearer test-token"
+            self.confluence_mcp_api_key = "test-token"
+            self.atlassian_cloud_id = "test-cloud-id"
 
         def search(self, query: str):
             assert query == "query"
@@ -68,7 +70,8 @@ def test_main_returns_error_for_missing_required_config(monkeypatch, capsys):
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = ""
-            self.mcp_auth_header = ""
+            self.confluence_mcp_api_key = ""
+            self.atlassian_cloud_id = ""
 
         def search(self, query: str):  # pragma: no cover - should never be called
             raise AssertionError("search should not run without required config")
@@ -81,14 +84,16 @@ def test_main_returns_error_for_missing_required_config(monkeypatch, capsys):
 
     assert exit_code == 1
     assert "OPENAI_API_KEY" in captured.err
-    assert "Atlassian auth" in captured.err
+    assert "CONFLUENCE_MCP_API_KEY" in captured.err
+    assert "ATLASSIAN_CLOUD_ID" in captured.err
 
 
 def test_main_allows_local_mode_without_real_openai_api_key(monkeypatch, capsys):
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = "ollama"
-            self.mcp_auth_header = "Bearer test-token"
+            self.confluence_mcp_api_key = "test-token"
+            self.atlassian_cloud_id = "test-cloud-id"
 
         def search(self, query: str):
             assert query == "query"
@@ -113,7 +118,8 @@ def test_main_prints_debug_failure_summary_to_stderr_without_json(monkeypatch, c
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = "test-openai-key"
-            self.mcp_auth_header = "Bearer test-token"
+            self.confluence_mcp_api_key = "test-token"
+            self.atlassian_cloud_id = "test-cloud-id"
 
         def search(self, query: str):
             assert query == "query"
@@ -159,3 +165,5 @@ def test_help_mentions_agentic_search_debug(capsys):
 
     assert excinfo.value.code == 0
     assert "AGENTIC_SEARCH_DEBUG" in captured.out
+    assert "CONFLUENCE_MCP_API_KEY" in captured.out
+    assert "ATLASSIAN_CLOUD_ID" in captured.out

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -9,7 +8,6 @@ from unittest.mock import AsyncMock, patch
 from mcp.types import CallToolResult, Tool
 
 from agentic_search import (
-    ACCESSIBLE_RESOURCES_TOOL,
     AgenticSearch,
     Citation,
     DEFAULT_OLLAMA_CHAT_MODEL,
@@ -57,57 +55,69 @@ def make_tool(name: str, properties: dict, required: list[str] | None = None) ->
 def make_search() -> AgenticSearch:
     return AgenticSearch(
         openai_api_key="test-openai-key",
-        mcp_auth_header="Bearer test-mcp-token",
+        confluence_mcp_api_key="test-mcp-token",
+        atlassian_cloud_id="test-cloud-id",
         model="gpt-4.1-mini",
     )
 
 
-def test_mcp_auth_header_takes_precedence_over_structured_auth_env(monkeypatch):
-    monkeypatch.setenv("MCP_AUTH_HEADER", "Bearer preferred-token")
-    monkeypatch.setenv("ATLASSIAN_SERVICE_ACCOUNT_KEY", "service-key")
+def test_confluence_mcp_api_key_builds_bearer_auth_header(monkeypatch):
+    monkeypatch.setenv("CONFLUENCE_MCP_API_KEY", "service-key")
+    monkeypatch.setenv("MCP_AUTH_HEADER", "Bearer ignored-token")
+    monkeypatch.setenv("ATLASSIAN_SERVICE_ACCOUNT_KEY", "ignored-service-key")
     monkeypatch.setenv("ATLASSIAN_API_EMAIL", "bot@example.com")
-    monkeypatch.setenv("ATLASSIAN_API_TOKEN", "api-token")
+    monkeypatch.setenv("ATLASSIAN_API_TOKEN", "ignored-api-token")
 
-    search = AgenticSearch(openai_api_key="test-openai-key")
-
-    assert search.mcp_auth_header == "Bearer preferred-token"
-
-
-def test_service_account_key_builds_bearer_auth_header(monkeypatch):
-    monkeypatch.delenv("MCP_AUTH_HEADER", raising=False)
-    monkeypatch.setenv("ATLASSIAN_SERVICE_ACCOUNT_KEY", "service-key")
-    monkeypatch.delenv("ATLASSIAN_API_EMAIL", raising=False)
-    monkeypatch.delenv("ATLASSIAN_API_TOKEN", raising=False)
-
-    search = AgenticSearch(openai_api_key="test-openai-key")
+    search = AgenticSearch(
+        openai_api_key="test-openai-key",
+        atlassian_cloud_id="test-cloud-id",
+    )
 
     assert search.mcp_auth_header == "Bearer service-key"
 
 
-def test_api_token_auth_builds_basic_header(monkeypatch):
-    monkeypatch.delenv("MCP_AUTH_HEADER", raising=False)
-    monkeypatch.delenv("ATLASSIAN_SERVICE_ACCOUNT_KEY", raising=False)
+def test_legacy_auth_env_vars_are_ignored(monkeypatch):
+    monkeypatch.setenv("MCP_AUTH_HEADER", "Bearer ignored-token")
+    monkeypatch.setenv("ATLASSIAN_SERVICE_ACCOUNT_KEY", "ignored-service-key")
     monkeypatch.setenv("ATLASSIAN_API_EMAIL", "bot@example.com")
-    monkeypatch.setenv("ATLASSIAN_API_TOKEN", "api-token")
-
-    search = AgenticSearch(openai_api_key="test-openai-key")
-
-    expected = base64.b64encode(b"bot@example.com:api-token").decode("ascii")
-    assert search.mcp_auth_header == f"Basic {expected}"
-
-
-def test_search_returns_configuration_error_when_atlassian_auth_is_missing(monkeypatch):
-    monkeypatch.delenv("MCP_AUTH_HEADER", raising=False)
-    monkeypatch.delenv("ATLASSIAN_SERVICE_ACCOUNT_KEY", raising=False)
-    monkeypatch.delenv("ATLASSIAN_API_EMAIL", raising=False)
-    monkeypatch.delenv("ATLASSIAN_API_TOKEN", raising=False)
+    monkeypatch.setenv("ATLASSIAN_API_TOKEN", "ignored-api-token")
+    monkeypatch.delenv("CONFLUENCE_MCP_API_KEY", raising=False)
+    monkeypatch.delenv("ATLASSIAN_CLOUD_ID", raising=False)
 
     search = AgenticSearch(openai_api_key="test-openai-key")
 
     result = search.search("What failed?")
 
+    assert search.mcp_auth_header == ""
     assert result["raw_response"]["status"] == "configuration_error"
-    assert "ATLASSIAN_SERVICE_ACCOUNT_KEY" in result["raw_response"]["missing_variable"]
+    assert result["raw_response"]["missing_variables"] == [
+        "CONFLUENCE_MCP_API_KEY",
+        "ATLASSIAN_CLOUD_ID",
+    ]
+
+
+def test_search_returns_configuration_error_when_api_key_is_missing():
+    search = AgenticSearch(
+        openai_api_key="test-openai-key",
+        atlassian_cloud_id="test-cloud-id",
+    )
+
+    result = search.search("What failed?")
+
+    assert result["raw_response"]["status"] == "configuration_error"
+    assert result["raw_response"]["missing_variables"] == ["CONFLUENCE_MCP_API_KEY"]
+
+
+def test_search_returns_configuration_error_when_cloud_id_is_missing():
+    search = AgenticSearch(
+        openai_api_key="test-openai-key",
+        confluence_mcp_api_key="test-mcp-token",
+    )
+
+    result = search.search("What failed?")
+
+    assert result["raw_response"]["status"] == "configuration_error"
+    assert result["raw_response"]["missing_variables"] == ["ATLASSIAN_CLOUD_ID"]
 
 
 def test_search_prefers_shared_search_and_fetch_tools():
@@ -171,7 +181,7 @@ def test_search_prefers_shared_search_and_fetch_tools():
     assert server.calls[1] == ("fetch", {"ari": "ari:cloud:confluence::page/123"})
 
 
-def test_search_prefers_explicit_mcp_cloud_id_over_discovery():
+def test_search_uses_explicit_atlassian_cloud_id_for_cloudid_tools():
     server = FakeServer(
         tools=[
             make_tool(
@@ -188,7 +198,6 @@ def test_search_prefers_explicit_mcp_cloud_id_over_discovery():
                 {"ari": {"type": "string"}, "cloudId": {"type": "string"}},
                 ["ari"],
             ),
-            make_tool(ACCESSIBLE_RESOURCES_TOOL, {}),
         ],
         responses={
             "search": CallToolResult(
@@ -212,16 +221,12 @@ def test_search_prefers_explicit_mcp_cloud_id_over_discovery():
                     "body": "Beam Benefits offers dental, vision, and supplemental benefits.",
                 },
             ),
-            ACCESSIBLE_RESOURCES_TOOL: CallToolResult(
-                content=[],
-                structuredContent={"resources": [{"cloudId": "discovered-cloud-id"}]},
-            ),
         },
     )
     search = AgenticSearch(
         openai_api_key="test-openai-key",
-        mcp_auth_header="Bearer test-mcp-token",
-        mcp_cloud_id="configured-cloud-id",
+        confluence_mcp_api_key="test-mcp-token",
+        atlassian_cloud_id="configured-cloud-id",
         model="gpt-4.1-mini",
     )
     search._synthesize_answer = AsyncMock(
@@ -253,89 +258,6 @@ def test_search_prefers_explicit_mcp_cloud_id_over_discovery():
         {
             "ari": "ari:cloud:confluence::page/123",
             "cloudId": "configured-cloud-id",
-        },
-    )
-    assert all(call[0] != ACCESSIBLE_RESOURCES_TOOL for call in server.calls)
-
-
-def test_search_discovers_cloud_id_when_mcp_cloud_id_is_unset():
-    server = FakeServer(
-        tools=[
-            make_tool(
-                "search",
-                {
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer"},
-                    "cloudId": {"type": "string"},
-                },
-                ["query"],
-            ),
-            make_tool(
-                "fetch",
-                {"ari": {"type": "string"}, "cloudId": {"type": "string"}},
-                ["ari"],
-            ),
-            make_tool(ACCESSIBLE_RESOURCES_TOOL, {}),
-        ],
-        responses={
-            ACCESSIBLE_RESOURCES_TOOL: CallToolResult(
-                content=[],
-                structuredContent={"resources": [{"cloudId": "discovered-cloud-id"}]},
-            ),
-            "search": CallToolResult(
-                content=[],
-                structuredContent={
-                    "results": [
-                        {
-                            "title": "Beam Benefits Overview",
-                            "url": "https://example.com/beam-overview",
-                            "excerpt": "Beam helps employers manage benefits.",
-                            "ari": "ari:cloud:confluence::page/123",
-                        }
-                    ]
-                },
-            ),
-            "fetch": CallToolResult(
-                content=[],
-                structuredContent={
-                    "title": "Beam Benefits Overview",
-                    "url": "https://example.com/beam-overview",
-                    "body": "Beam Benefits offers dental, vision, and supplemental benefits.",
-                },
-            ),
-        },
-    )
-    search = make_search()
-    search._synthesize_answer = AsyncMock(
-        return_value=SynthesizedAnswer(
-            answer="Beam Benefits offers dental, vision, and supplemental benefits.",
-            citations=[
-                Citation(
-                    title="Beam Benefits Overview",
-                    url="https://example.com/beam-overview",
-                )
-            ],
-        )
-    )
-
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
-        result = search.search("What is Beam Benefits?")
-
-    assert result["raw_response"]["status"] == "ok"
-    assert server.calls[0] == (ACCESSIBLE_RESOURCES_TOOL, {})
-    assert server.calls[1] == (
-        "search",
-        {
-            "query": "What is Beam Benefits?",
-            "limit": 5,
-            "cloudId": "discovered-cloud-id",
-        },
-    )
-    assert server.calls[2] == (
-        "fetch",
-        {
-            "ari": "ari:cloud:confluence::page/123",
-            "cloudId": "discovered-cloud-id",
         },
     )
 
@@ -492,7 +414,7 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
     assert "api_token" not in serialized
     assert debug["mcp_server_url"] == search.mcp_server_url
     assert debug["mcp_server_name"] == search.mcp_server_name
-    assert debug["calls"][0]["response_summary"]["top_level_keys"] == ["results", "[REDACTED]"]
+    assert debug["calls"][0]["response_summary"]["top_level_keys"] == ["results"]
 
 
 def test_search_debug_list_tools_failure_prints_stderr_error_line(monkeypatch, capsys):
@@ -551,7 +473,6 @@ def test_search_debug_redacts_json_string_http_response_body(monkeypatch, capsys
     serialized = json.dumps(debug).lower()
     assert result["raw_response"]["status"] == "search_error"
     assert debug["http_status"] == 403
-    assert '"[REDACTED]": "[REDACTED]"' in preview
     assert '"mode": "[REDACTED_AUTH]"' in preview
     assert "top-secret" not in preview
     assert "secret-token" not in preview
@@ -585,8 +506,7 @@ def test_search_debug_call_tool_failure_prints_stderr_error_line(monkeypatch, ca
     assert debug["last_step"] == "call_tool:search"
     assert debug["error_type"] == "RuntimeError"
     assert "boom" in debug["error_message"]
-    assert "traceback" in debug
-    assert '"error_message": "boom [REDACTED_SECRET]"' in captured.err
+    assert '"error_message": "boom [REDACTED_AUTH]"' in captured.err
     assert "[AgenticSearch debug] call_tool:" in captured.err
     assert "[AgenticSearch debug] error:" in captured.err
     assert "secret-token" not in captured.err
@@ -645,7 +565,8 @@ def test_local_mode_configures_async_openai_client_and_chat_completions_api():
     search = AgenticSearch(
         openai_api_key="",
         llm_base_url="http://localhost:11434/v1",
-        mcp_auth_header="Bearer test-mcp-token",
+        confluence_mcp_api_key="test-mcp-token",
+        atlassian_cloud_id="test-cloud-id",
     )
     search._synthesize_answer = AsyncMock(
         return_value=SynthesizedAnswer(
@@ -683,7 +604,8 @@ def test_local_mode_uses_default_ollama_chat_model_when_openai_model_is_unset(mo
     search = AgenticSearch(
         openai_api_key="",
         llm_base_url="http://localhost:11434/v1",
-        mcp_auth_header="Bearer test-mcp-token",
+        confluence_mcp_api_key="test-mcp-token",
+        atlassian_cloud_id="test-cloud-id",
     )
 
     assert search.model == DEFAULT_OLLAMA_CHAT_MODEL
@@ -693,7 +615,8 @@ def test_local_mode_falls_back_to_plain_text_synthesis_when_structured_output_fa
     search = AgenticSearch(
         openai_api_key="",
         llm_base_url="http://localhost:11434/v1",
-        mcp_auth_header="Bearer test-mcp-token",
+        confluence_mcp_api_key="test-mcp-token",
+        atlassian_cloud_id="test-cloud-id",
     )
     documents = [
         search._normalize_documents(

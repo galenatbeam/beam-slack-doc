@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import re
 import sys
-import traceback
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Mapping, Sequence
 
@@ -35,78 +33,50 @@ SHARED_SEARCH_TOOL = "search"
 SHARED_FETCH_TOOL = "fetch"
 CONFLUENCE_SEARCH_TOOL = "searchConfluenceUsingCqlSearch"
 CONFLUENCE_FETCH_TOOL = "getConfluencePage"
-ACCESSIBLE_RESOURCES_TOOL = "getAccessibleAtlassianResources"
 TITLE_KEYS = ("title", "name", "pageTitle")
 URL_KEYS = ("url", "webLink", "link", "pageUrl")
 EXCERPT_KEYS = ("excerpt", "snippet", "summary", "text")
 ID_KEYS = ("id", "pageId", "contentId", "entityId")
 ARI_KEYS = ("ari", "resourceAri", "resourceARI", "resourceId")
 CONTENT_KEYS = ("body", "content", "markdown", "value")
-ATLASSIAN_AUTH_CONFIG = (
-    "MCP_AUTH_HEADER or ATLASSIAN_SERVICE_ACCOUNT_KEY or "
-    "ATLASSIAN_API_EMAIL + ATLASSIAN_API_TOKEN"
-)
+CONFLUENCE_MCP_API_KEY_ENV = "CONFLUENCE_MCP_API_KEY"
+ATLASSIAN_CLOUD_ID_ENV = "ATLASSIAN_CLOUD_ID"
 DEBUG_ENV_VAR = "AGENTIC_SEARCH_DEBUG"
 DEBUG_TRUE_VALUES = {"1", "true", "yes"}
-TRACEBACK_CHAR_LIMIT = 2000
 ERROR_PREVIEW_CHAR_LIMIT = 300
-SECRET_KEY_FRAGMENTS = (
-    "auth",
-    "authorization",
-    "token",
-    "secret",
-    "password",
-    "credential",
+SENSITIVE_DEBUG_KEYS = {
     "api_key",
-    "apikey",
-    "email",
-    "bearer",
-    "basic",
-)
-SECRET_VALUE_PATTERNS = (
-    (re.compile(r"Bearer\s+[^\s]+", re.IGNORECASE), "[REDACTED_AUTH]"),
-    (re.compile(r"Basic\s+[^\s]+", re.IGNORECASE), "[REDACTED_AUTH]"),
-    (
-        re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
-        "[REDACTED_EMAIL]",
-    ),
-    (
-        re.compile(
-            r"(?i)(api[_ -]?token|api[_ -]?key|access[_ -]?token|authorization|password|secret)"
-            r"\s*[:=]\s*[^\s,;]+"
-        ),
-        "[REDACTED_SECRET]",
-    ),
+    "api_token",
+    "authorization",
+    "headers",
+    "password",
+    "secret",
+    "token",
+}
+AUTH_TEXT_PATTERNS = (
+    (re.compile(r"(?i)authorization\s*[:=]\s*bearer\s+[^\s,;]+"), "[REDACTED_AUTH]"),
+    (re.compile(r"(?i)authorization\s*[:=]\s*basic\s+[^\s,;]+"), "[REDACTED_AUTH]"),
+    (re.compile(r"(?i)bearer\s+[^\s,;]+"), "[REDACTED_AUTH]"),
+    (re.compile(r"(?i)basic\s+[^\s,;]+"), "[REDACTED_AUTH]"),
 )
 
 
 def build_mcp_auth_header(
-    explicit_header: str | None = None,
+    api_key: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> str:
-    """Build the Atlassian MCP Authorization header from supported config sources."""
+    """Build the Atlassian MCP Authorization header from the MCP API key."""
     resolved_env = env or os.environ
-    header = (explicit_header or "").strip() or resolved_env.get("MCP_AUTH_HEADER", "").strip()
-    if header:
-        return header
-
-    service_account_key = resolved_env.get("ATLASSIAN_SERVICE_ACCOUNT_KEY", "").strip()
-    if service_account_key:
-        return f"Bearer {service_account_key}"
-
-    api_email = resolved_env.get("ATLASSIAN_API_EMAIL", "").strip()
-    api_token = resolved_env.get("ATLASSIAN_API_TOKEN", "").strip()
-    if api_email and api_token:
-        encoded_credentials = base64.b64encode(
-            f"{api_email}:{api_token}".encode("utf-8")
-        ).decode("ascii")
-        return f"Basic {encoded_credentials}"
-
-    return ""
+    resolved_api_key = (api_key or resolved_env.get(CONFLUENCE_MCP_API_KEY_ENV, "")).strip()
+    return f"Bearer {resolved_api_key}" if resolved_api_key else ""
 
 
 def _env_flag(value: str | None) -> bool:
     return (value or "").strip().lower() in DEBUG_TRUE_VALUES
+
+
+def _is_sensitive_debug_key(key: str) -> bool:
+    return key.lower().replace("-", "_") in SENSITIVE_DEBUG_KEYS
 
 
 class Citation(BaseModel):
@@ -158,8 +128,8 @@ class AgenticSearch:
         model: str | None = None,
         llm_base_url: str | None = None,
         mcp_server_url: str | None = None,
-        mcp_auth_header: str | None = None,
-        mcp_cloud_id: str | None = None,
+        confluence_mcp_api_key: str | None = None,
+        atlassian_cloud_id: str | None = None,
         max_results: int = 5,
     ) -> None:
         self.llm_base_url = (llm_base_url or os.getenv("LLM_BASE_URL", "")).strip()
@@ -177,8 +147,13 @@ class AgenticSearch:
         self.mcp_server_url = mcp_server_url or os.getenv(
             "MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL
         )
-        self.mcp_auth_header = build_mcp_auth_header(mcp_auth_header)
-        self.mcp_cloud_id = (mcp_cloud_id or os.getenv("MCP_CLOUD_ID", "")).strip()
+        self.confluence_mcp_api_key = (
+            confluence_mcp_api_key or os.getenv(CONFLUENCE_MCP_API_KEY_ENV, "")
+        ).strip()
+        self.mcp_auth_header = build_mcp_auth_header(self.confluence_mcp_api_key)
+        self.atlassian_cloud_id = (
+            atlassian_cloud_id or os.getenv(ATLASSIAN_CLOUD_ID_ENV, "")
+        ).strip()
         self.max_results = max(1, max_results)
         self.debug_enabled = _env_flag(os.getenv(DEBUG_ENV_VAR))
         self._debug_state: dict[str, Any] | None = None
@@ -187,6 +162,16 @@ class AgenticSearch:
     @property
     def uses_local_llm(self) -> bool:
         return bool(self.llm_base_url)
+
+    def missing_configuration(self) -> list[str]:
+        missing: list[str] = []
+        if not self.uses_local_llm and not self.openai_api_key:
+            missing.append("OPENAI_API_KEY")
+        if not self.confluence_mcp_api_key:
+            missing.append(CONFLUENCE_MCP_API_KEY_ENV)
+        if not self.atlassian_cloud_id:
+            missing.append(ATLASSIAN_CLOUD_ID_ENV)
+        return missing
 
     def search(self, query: str) -> Dict[str, Any]:
         """Search documentation and return a structured answer with citations."""
@@ -204,11 +189,9 @@ class AgenticSearch:
                 "raw_response": self._with_debug(raw_response),
             }
 
-        if not self.uses_local_llm and not self.openai_api_key:
-            return self._configuration_error_response(clean_query, "OPENAI_API_KEY")
-
-        if not self.mcp_auth_header:
-            return self._configuration_error_response(clean_query, ATLASSIAN_AUTH_CONFIG)
+        missing = self.missing_configuration()
+        if missing:
+            return self._configuration_error_response(clean_query, missing)
 
         try:
             self._start_debug_session()
@@ -359,19 +342,7 @@ class AgenticSearch:
         if not any(self._tool_accepts_param(tool, "cloudId") for tool in selected_tools):
             return None
 
-        if self.mcp_cloud_id:
-            return self.mcp_cloud_id
-
-        if ACCESSIBLE_RESOURCES_TOOL not in tool_map:
-            return None
-
-        resources_payload = await self._call_tool(server, ACCESSIBLE_RESOURCES_TOOL, {})
-        for resource in self._iter_nested_dicts(self._extract_payload(resources_payload)):
-            cloud_id = self._first_string(resource, ("cloudId",))
-            if cloud_id:
-                return cloud_id
-
-        return None
+        return self.atlassian_cloud_id or None
 
     def _build_search_arguments(
         self,
@@ -763,7 +734,7 @@ class AgenticSearch:
         self._set_last_step(f"call_tool:{tool_name}")
         call_debug = {
             "tool_name": tool_name,
-            "argument_keys": [self._sanitize_key_name(key) for key in arguments.keys()],
+            "argument_keys": [key for key in arguments.keys() if not _is_sensitive_debug_key(key)],
         }
         try:
             payload = await server.call_tool(tool_name, dict(arguments))
@@ -843,11 +814,12 @@ class AgenticSearch:
             keys: list[str] = []
             counts: dict[str, int] = {}
             for key, value in extracted.items():
-                safe_key = self._sanitize_key_name(key)
-                keys.append(safe_key)
+                if _is_sensitive_debug_key(key):
+                    continue
+                keys.append(key)
                 count = self._summary_count(value)
                 if count is not None:
-                    counts[safe_key] = count
+                    counts[key] = count
             summary["top_level_keys"] = keys
             if counts:
                 summary["counts"] = counts
@@ -873,11 +845,9 @@ class AgenticSearch:
         if isinstance(value, dict):
             sanitized: dict[str, Any] = {}
             for key, nested in value.items():
-                safe_key = self._sanitize_key_name(key)
-                if safe_key == "[REDACTED]":
-                    sanitized[safe_key] = "[REDACTED]"
-                else:
-                    sanitized[safe_key] = self._sanitize_debug_object(nested)
+                if _is_sensitive_debug_key(key):
+                    continue
+                sanitized[key] = self._sanitize_debug_object(nested)
             return sanitized
         if isinstance(value, list):
             return [self._sanitize_debug_object(item) for item in value]
@@ -887,19 +857,13 @@ class AgenticSearch:
             return self._redact_text(value)
         return value
 
-    def _sanitize_key_name(self, key: str) -> str:
-        normalized = key.lower().replace("-", "_")
-        if any(fragment in normalized for fragment in SECRET_KEY_FRAGMENTS):
-            return "[REDACTED]"
-        return key
-
     def _redact_text(self, text: str) -> str:
         sanitized_json = self._sanitize_json_text(text)
         if sanitized_json is not None:
             return sanitized_json
 
         redacted = text
-        for pattern, replacement in SECRET_VALUE_PATTERNS:
+        for pattern, replacement in AUTH_TEXT_PATTERNS:
             redacted = pattern.sub(replacement, redacted)
         return redacted
 
@@ -926,6 +890,8 @@ class AgenticSearch:
         if value is None:
             return None
         sanitized = self._sanitize_debug_object(value)
+        if sanitized in ({}, [], ()):
+            return None
         if isinstance(sanitized, str):
             return self._truncate_text(sanitized)
         serialized = json.dumps(sanitized, ensure_ascii=False)
@@ -1060,8 +1026,6 @@ class AgenticSearch:
             snapshot["error_type"] = type(exc).__name__
             snapshot["error_message"] = self._preview_text(str(exc))
             snapshot.update(self._extract_exception_debug_details(exc))
-            formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            snapshot["traceback"] = self._redact_text(formatted[:TRACEBACK_CHAR_LIMIT])
         return snapshot
 
     def _with_debug(self, raw_response: dict[str, Any], exc: Exception | None = None) -> dict[str, Any]:
@@ -1073,12 +1037,12 @@ class AgenticSearch:
         return raw_response
 
     def _configuration_error_response(
-        self, query: str, missing_variable: str
+        self, query: str, missing_variables: Sequence[str]
     ) -> Dict[str, Any]:
         raw_response = {
             "status": "configuration_error",
             "query": query,
-            "missing_variable": missing_variable,
+            "missing_variables": list(missing_variables),
             "model": self.model,
             "mcp_server_url": self.mcp_server_url,
         }
