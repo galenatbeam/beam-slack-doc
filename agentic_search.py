@@ -83,8 +83,15 @@ def _env_flag(value: str | None) -> bool:
     return (value or "").strip().lower() in DEBUG_TRUE_VALUES
 
 
+def _normalize_debug_key(key: str) -> str:
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key.strip())
+    normalized = normalized.replace("-", "_")
+    normalized = re.sub(r"_+", "_", normalized)
+    return normalized.lower().strip("_")
+
+
 def _is_sensitive_debug_key(key: str) -> bool:
-    return key.lower().replace("-", "_") in SENSITIVE_DEBUG_KEYS
+    return _normalize_debug_key(key) in SENSITIVE_DEBUG_KEYS
 
 
 class Citation(BaseModel):

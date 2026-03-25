@@ -17,6 +17,7 @@ from agentic_search import (
     SHARED_FETCH_TOOL,
     SHARED_SEARCH_TOOL,
     SynthesizedAnswer,
+    _is_sensitive_debug_key,
 )
 
 
@@ -69,6 +70,11 @@ def make_search() -> AgenticSearch:
         atlassian_cloud_id="test-cloud-id",
         model="gpt-4.1-mini",
     )
+
+
+def test_sensitive_debug_key_detection_normalizes_camel_case_variants():
+    for key in ["token", "authorization", "api_token", "api-token", "API_TOKEN", "apiToken"]:
+        assert _is_sensitive_debug_key(key) is True
 
 
 def make_discovered_tools() -> list[Tool]:
@@ -451,6 +457,7 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
                         }
                     ],
                     "api_token": "super-secret-token",
+                    "apiToken": "camel-secret-token",
                     "authorization": "Bearer secret-token",
                     "note": "Authorization=Bearer another-secret-token",
                 },
@@ -487,8 +494,10 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
     payload_preview = debug["calls"][0]["payload_preview"]
     assert "Debug Doc" in payload_preview
     assert "super-secret-token" not in payload_preview
+    assert "camel-secret-token" not in payload_preview
     assert "secret-token" not in payload_preview
     assert "Bearer" not in payload_preview
+    assert "apitoken" not in payload_preview.lower()
     assert "authorization" not in payload_preview.lower()
     assert "api_token" not in payload_preview.lower()
 
