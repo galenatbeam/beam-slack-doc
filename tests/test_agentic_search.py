@@ -13,6 +13,7 @@ from agentic_search import (
     Citation,
     CONFLUENCE_AUTH_ISSUE_MESSAGE,
     DEFAULT_OLLAMA_CHAT_MODEL,
+    PAYLOAD_PREVIEW_CHAR_LIMIT,
     SHARED_FETCH_TOOL,
     SHARED_SEARCH_TOOL,
     SynthesizedAnswer,
@@ -431,6 +432,7 @@ def test_search_omits_debug_block_when_debug_disabled(monkeypatch):
         result = search.search("debug me")
 
     assert "debug" not in result["raw_response"]
+    assert "payload_preview" not in json.dumps(result["raw_response"])
 
 
 def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
@@ -449,6 +451,8 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
                         }
                     ],
                     "api_token": "super-secret-token",
+                    "authorization": "Bearer secret-token",
+                    "note": "Authorization=Bearer another-secret-token",
                 },
             )
         },
@@ -479,7 +483,52 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
     }
     assert debug["calls"][0]["tool_name"] == SHARED_SEARCH_TOOL
     assert debug["calls"][0]["argument_keys"] == ["query", "cloudId"]
-    assert debug["calls"][0]["response_summary"]["top_level_keys"] == ["results"]
+    assert "results" in debug["calls"][0]["response_summary"]["top_level_keys"]
+    payload_preview = debug["calls"][0]["payload_preview"]
+    assert "Debug Doc" in payload_preview
+    assert "super-secret-token" not in payload_preview
+    assert "secret-token" not in payload_preview
+    assert "Bearer" not in payload_preview
+    assert "authorization" not in payload_preview.lower()
+    assert "api_token" not in payload_preview.lower()
+
+
+def test_search_truncates_payload_preview_when_debug_enabled(monkeypatch):
+    monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
+    oversized_text = "x" * (PAYLOAD_PREVIEW_CHAR_LIMIT + 500)
+    server = FakeServer(
+        tools=make_discovered_tools(),
+        responses={
+            SHARED_SEARCH_TOOL: CallToolResult(
+                content=[],
+                structuredContent={
+                    "results": [
+                        {
+                            "title": "Large Debug Doc",
+                            "url": "https://example.com/large-debug-doc",
+                            "excerpt": oversized_text,
+                        }
+                    ]
+                },
+            )
+        },
+    )
+    search = make_search()
+
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        return FakeRunResult(SynthesizedAnswer(answer="Large debug excerpt.", citations=[]))
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
+        result = search.search("debug me")
+
+    payload_preview = result["raw_response"]["debug"]["calls"][0]["payload_preview"]
+    assert len(payload_preview) == PAYLOAD_PREVIEW_CHAR_LIMIT
+    assert payload_preview.endswith("…")
+    assert oversized_text not in payload_preview
 
 
 def test_search_debug_call_tool_failure_with_http_error_prints_stderr_error_line(monkeypatch, capsys):

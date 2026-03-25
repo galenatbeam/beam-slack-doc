@@ -47,6 +47,7 @@ DEBUG_ENV_VAR = "AGENTIC_SEARCH_DEBUG"
 DEBUG_TRUE_VALUES = {"1", "true", "yes"}
 ERROR_PREVIEW_CHAR_LIMIT = 300
 TOOL_CONTENT_CHAR_LIMIT = 4000
+PAYLOAD_PREVIEW_CHAR_LIMIT = 1200
 CONFLUENCE_AUTH_ISSUE_MESSAGE = (
     "Confluence authentication issue. Please verify the Atlassian MCP "
     "credentials and try again."
@@ -1032,6 +1033,10 @@ class AgenticSearch:
             raise
 
         call_debug["response_summary"] = self._summarize_payload(payload)
+        if self.debug_enabled:
+            payload_preview = self._build_payload_preview(payload)
+            if payload_preview:
+                call_debug["payload_preview"] = payload_preview
         self._record_call_debug(call_debug)
         return payload
 
@@ -1183,6 +1188,73 @@ class AgenticSearch:
             return self._truncate_text(sanitized)
         serialized = json.dumps(sanitized, ensure_ascii=False)
         return self._truncate_text(serialized)
+
+    def _build_payload_preview(self, payload: Any) -> str | None:
+        preview_source: dict[str, Any] = {}
+        is_error = getattr(payload, "isError", None)
+        if is_error:
+            preview_source["isError"] = True
+
+        structured_content = getattr(payload, "structuredContent", None)
+        if structured_content is not None:
+            preview_source["structuredContent"] = structured_content
+
+        content_preview = self._normalize_debug_preview_value(getattr(payload, "content", None))
+        if content_preview not in (None, [], {}):
+            preview_source["content"] = content_preview
+
+        if not preview_source:
+            extracted = self._extract_payload(payload)
+            if extracted is payload:
+                preview_source = {"value": self._normalize_debug_preview_value(payload)}
+            else:
+                preview_source = {"value": extracted}
+
+        return self._preview_debug_value_deterministic(
+            preview_source,
+            limit=PAYLOAD_PREVIEW_CHAR_LIMIT,
+        )
+
+    def _normalize_debug_preview_value(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Mapping):
+            return {
+                str(key): self._normalize_debug_preview_value(nested)
+                for key, nested in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._normalize_debug_preview_value(item) for item in value]
+        if hasattr(value, "model_dump"):
+            try:
+                dumped = value.model_dump(exclude_none=True)
+            except TypeError:
+                dumped = value.model_dump()
+            return self._normalize_debug_preview_value(dumped)
+        if hasattr(value, "__dict__"):
+            nested = {
+                key: nested_value
+                for key, nested_value in vars(value).items()
+                if not key.startswith("_")
+            }
+            if nested:
+                return self._normalize_debug_preview_value(nested)
+        return str(value)
+
+    def _preview_debug_value_deterministic(
+        self,
+        value: Any,
+        limit: int = ERROR_PREVIEW_CHAR_LIMIT,
+    ) -> str | None:
+        if value is None:
+            return None
+        sanitized = self._sanitize_debug_object(self._normalize_debug_preview_value(value))
+        if sanitized in ({}, [], (), ""):
+            return None
+        if isinstance(sanitized, str):
+            return self._truncate_text(sanitized, limit=limit)
+        serialized = json.dumps(sanitized, ensure_ascii=False, sort_keys=True)
+        return self._truncate_text(serialized, limit=limit)
 
     def _extract_payload_error_text(self, payload: Any, extracted: Any) -> str | None:
         text = self._error_text_from_value(extracted)
