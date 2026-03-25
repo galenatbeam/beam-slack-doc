@@ -71,6 +71,9 @@ AUTH_TEXT_PATTERNS = (
     (re.compile(r"(?i)bearer\s+[^\s,;]+"), "[REDACTED_AUTH]"),
     (re.compile(r"(?i)basic\s+[^\s,;]+"), "[REDACTED_AUTH]"),
 )
+SUPPORTED_TOOL_SCHEMA_KEYS = frozenset(
+    {"type", "properties", "required", "description", "items", "enum", "anyOf", "oneOf"}
+)
 
 
 def build_mcp_auth_header(
@@ -338,11 +341,10 @@ class AgenticSearch:
     ) -> FunctionTool:
         tool_name = tool.name
         description = getattr(tool, "description", None) or f"MCP tool '{tool_name}'."
-        params_json_schema = getattr(tool, "inputSchema", None) or {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        }
+        params_json_schema = self._sanitize_tool_input_schema(
+            tool_name,
+            getattr(tool, "inputSchema", None),
+        )
 
         async def on_invoke_tool(_ctx: Any, input_json: str) -> str:
             arguments = self._prepare_discovered_tool_arguments(
@@ -367,6 +369,190 @@ class AgenticSearch:
             description=description,
             params_json_schema=params_json_schema,
             on_invoke_tool=on_invoke_tool,
+        )
+
+    def _sanitize_tool_input_schema(self, tool_name: str, input_schema: Any) -> dict[str, Any]:
+        if not isinstance(input_schema, Mapping):
+            return {"type": "object", "properties": {}}
+
+        stripped_keys: list[str] = []
+        sanitized = self._sanitize_tool_schema_node(input_schema, "$", stripped_keys)
+
+        if sanitized.get("type") != "object":
+            stripped_keys.append("$.type")
+            sanitized = {"type": "object", "properties": {}}
+        else:
+            sanitized["type"] = "object"
+            if not isinstance(sanitized.get("properties"), dict):
+                sanitized["properties"] = {}
+
+        required = sanitized.get("required")
+        if isinstance(required, list):
+            filtered_required = [
+                item for item in required if isinstance(item, str) and item in sanitized["properties"]
+            ]
+            if filtered_required:
+                sanitized["required"] = filtered_required
+            else:
+                sanitized.pop("required", None)
+        else:
+            sanitized.pop("required", None)
+
+        if stripped_keys or sanitized != input_schema:
+            self._record_sanitized_tool_schema(tool_name, input_schema, sanitized, stripped_keys)
+
+        return sanitized
+
+    def _sanitize_tool_schema_node(
+        self,
+        schema: Mapping[str, Any],
+        path: str,
+        stripped_keys: list[str],
+    ) -> dict[str, Any]:
+        sanitized: dict[str, Any] = {}
+
+        for key, value in schema.items():
+            key_path = self._schema_path(path, str(key))
+            if key not in SUPPORTED_TOOL_SCHEMA_KEYS:
+                stripped_keys.append(key_path)
+                continue
+
+            if key == "type":
+                normalized_type = self._normalize_schema_type(value)
+                if normalized_type is None:
+                    stripped_keys.append(key_path)
+                    continue
+                sanitized[key] = normalized_type
+                continue
+
+            if key == "properties":
+                if not isinstance(value, Mapping):
+                    stripped_keys.append(key_path)
+                    continue
+                sanitized[key] = {
+                    str(property_name): self._sanitize_tool_schema_child(
+                        property_schema,
+                        self._schema_path(key_path, str(property_name)),
+                        stripped_keys,
+                    )
+                    for property_name, property_schema in value.items()
+                }
+                continue
+
+            if key == "required":
+                if not isinstance(value, list):
+                    stripped_keys.append(key_path)
+                    continue
+                sanitized[key] = [item for item in value if isinstance(item, str)]
+                continue
+
+            if key == "description":
+                if isinstance(value, str) and value.strip():
+                    sanitized[key] = value
+                else:
+                    stripped_keys.append(key_path)
+                continue
+
+            if key == "enum":
+                if not isinstance(value, list):
+                    stripped_keys.append(key_path)
+                    continue
+                sanitized[key] = [
+                    item
+                    for item in value
+                    if item is None or isinstance(item, (str, int, float, bool))
+                ]
+                continue
+
+            if key == "items":
+                if isinstance(value, Mapping):
+                    sanitized[key] = self._sanitize_tool_schema_node(value, key_path, stripped_keys)
+                elif isinstance(value, list):
+                    sanitized[key] = [
+                        self._sanitize_tool_schema_child(item, f"{key_path}[{index}]", stripped_keys)
+                        for index, item in enumerate(value)
+                    ]
+                else:
+                    stripped_keys.append(key_path)
+                continue
+
+            if key in {"anyOf", "oneOf"}:
+                if not isinstance(value, list):
+                    stripped_keys.append(key_path)
+                    continue
+                options = [
+                    self._sanitize_tool_schema_child(item, f"{key_path}[{index}]", stripped_keys)
+                    for index, item in enumerate(value)
+                ]
+                if options:
+                    sanitized[key] = options
+                else:
+                    stripped_keys.append(key_path)
+
+        if sanitized.get("type") == "object":
+            sanitized.setdefault("properties", {})
+            required = sanitized.get("required")
+            if isinstance(required, list):
+                filtered_required = [
+                    item for item in required if item in sanitized["properties"]
+                ]
+                if filtered_required:
+                    sanitized["required"] = filtered_required
+                else:
+                    sanitized.pop("required", None)
+        elif "required" in sanitized:
+            sanitized.pop("required", None)
+
+        return sanitized
+
+    def _sanitize_tool_schema_child(self, schema: Any, path: str, stripped_keys: list[str]) -> dict[str, Any]:
+        if not isinstance(schema, Mapping):
+            stripped_keys.append(path)
+            return {}
+        return self._sanitize_tool_schema_node(schema, path, stripped_keys)
+
+    def _normalize_schema_type(self, value: Any) -> str | None:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            non_null_types = [item for item in value if isinstance(item, str) and item != "null"]
+            if len(non_null_types) == 1:
+                return non_null_types[0]
+        return None
+
+    def _schema_path(self, path: str, key: str) -> str:
+        return f"{path}.{key}" if path else key
+
+    def _record_sanitized_tool_schema(
+        self,
+        tool_name: str,
+        original_schema: Mapping[str, Any],
+        sanitized_schema: Mapping[str, Any],
+        stripped_keys: Sequence[str],
+    ) -> None:
+        if not self.debug_enabled:
+            return
+
+        unique_stripped_keys = list(dict.fromkeys(stripped_keys))
+        entry: dict[str, Any] = {
+            "tool_name": tool_name,
+            "stripped_keys": unique_stripped_keys,
+        }
+
+        original_preview = self._preview_debug_value_deterministic(original_schema)
+        if original_preview:
+            entry["original_schema_preview"] = original_preview
+
+        sanitized_preview = self._preview_debug_value_deterministic(sanitized_schema)
+        if sanitized_preview:
+            entry["sanitized_schema_preview"] = sanitized_preview
+
+        sanitized_entry = self._sanitize_debug_object(entry)
+        if self._debug_state is not None:
+            self._debug_state.setdefault("sanitized_tool_schemas", []).append(sanitized_entry)
+        print(
+            f"[AgenticSearch debug] sanitized_tool_schema: {json.dumps(sanitized_entry, ensure_ascii=False)}",
+            file=sys.stderr,
         )
 
     def _parse_tool_input(self, input_json: str) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -18,6 +19,7 @@ from agentic_search import (
     SHARED_SEARCH_TOOL,
     SynthesizedAnswer,
     _is_sensitive_debug_key,
+    build_mcp_auth_header,
 )
 
 
@@ -52,20 +54,31 @@ class FakeServer:
         return self.responses[tool_name]
 
 
-def make_tool(name: str, properties: dict, required: list[str] | None = None) -> Tool:
+def make_tool(
+    name: str,
+    properties: dict,
+    required: list[str] | None = None,
+    *,
+    schema_extras: dict | None = None,
+) -> Tool:
+    input_schema = {
+        "type": "object",
+        "properties": properties,
+        "required": required or [],
+        "additionalProperties": False,
+    }
+    if schema_extras:
+        input_schema.update(schema_extras)
     return Tool(
         name=name,
-        inputSchema={
-            "type": "object",
-            "properties": properties,
-            "required": required or [],
-        },
+        inputSchema=input_schema,
     )
 
 
 def make_search() -> AgenticSearch:
     return AgenticSearch(
         openai_api_key="test-openai-key",
+        atlassian_email="bot@example.com",
         confluence_mcp_api_key="test-mcp-token",
         atlassian_cloud_id="test-cloud-id",
         model="gpt-4.1-mini",
@@ -97,6 +110,68 @@ def make_discovered_tools() -> list[Tool]:
             required=["ari"],
         ),
     ]
+
+
+def test_build_discovered_function_tool_sanitizes_schema_before_function_tool_creation():
+    search = make_search()
+    tool = make_tool(
+        SHARED_SEARCH_TOOL,
+        {
+            "query": {"type": "string", "description": "Natural language query."},
+            "filters": {
+                "type": "object",
+                "properties": {
+                    "space": {"type": "string"},
+                },
+                "required": ["space"],
+                "additionalProperties": False,
+                "patternProperties": {".*": {"type": "string"}},
+            },
+            "tags": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"label": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+        },
+        required=["query", "filters"],
+        schema_extras={"patternProperties": {".*": {"type": "string"}}},
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_function_tool(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    with patch("agentic_search.FunctionTool", side_effect=fake_function_tool):
+        function_tool = search._build_discovered_function_tool(FakeServer(), tool, [])
+
+    assert function_tool.name == SHARED_SEARCH_TOOL
+    assert captured["params_json_schema"] == {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Natural language query."},
+            "filters": {
+                "type": "object",
+                "properties": {"space": {"type": "string"}},
+                "required": ["space"],
+            },
+            "tags": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"label": {"type": "string"}},
+                },
+            },
+        },
+        "required": ["query", "filters"],
+    }
+    serialized_schema = json.dumps(captured["params_json_schema"])
+    assert "additionalProperties" not in serialized_schema
+    assert "patternProperties" not in serialized_schema
 
 
 class FakeRunResult:
@@ -161,19 +236,16 @@ def rovo_search_ari_only_payload() -> CallToolResult:
     )
 
 
-def test_confluence_mcp_api_key_builds_bearer_auth_header(monkeypatch):
-    monkeypatch.setenv("CONFLUENCE_MCP_API_KEY", "service-key")
-    monkeypatch.setenv("MCP_AUTH_HEADER", "Bearer ignored-token")
-    monkeypatch.setenv("ATLASSIAN_SERVICE_ACCOUNT_KEY", "ignored-service-key")
-    monkeypatch.setenv("ATLASSIAN_API_EMAIL", "bot@example.com")
-    monkeypatch.setenv("ATLASSIAN_API_TOKEN", "ignored-api-token")
-
-    search = AgenticSearch(
-        openai_api_key="test-openai-key",
-        atlassian_cloud_id="test-cloud-id",
+def test_build_mcp_auth_header_uses_basic_auth_and_base64_email_and_token():
+    header = build_mcp_auth_header(
+        env={
+            "ATLASSIAN_EMAIL": "bot@example.com",
+            "CONFLUENCE_MCP_API_KEY": "service-key",
+        }
     )
 
-    assert search.mcp_auth_header == "Bearer service-key"
+    expected = base64.b64encode(b"bot@example.com:service-key").decode("ascii")
+    assert header == f"Basic {expected}"
 
 
 def test_legacy_auth_env_vars_are_ignored(monkeypatch):
@@ -182,6 +254,7 @@ def test_legacy_auth_env_vars_are_ignored(monkeypatch):
     monkeypatch.setenv("ATLASSIAN_API_EMAIL", "bot@example.com")
     monkeypatch.setenv("ATLASSIAN_API_TOKEN", "ignored-api-token")
     monkeypatch.delenv("CONFLUENCE_MCP_API_KEY", raising=False)
+    monkeypatch.delenv("ATLASSIAN_EMAIL", raising=False)
     monkeypatch.delenv("ATLASSIAN_CLOUD_ID", raising=False)
 
     search = AgenticSearch(openai_api_key="test-openai-key")
@@ -191,15 +264,29 @@ def test_legacy_auth_env_vars_are_ignored(monkeypatch):
     assert search.mcp_auth_header == ""
     assert result["raw_response"]["status"] == "configuration_error"
     assert result["raw_response"]["missing_variables"] == [
+        "ATLASSIAN_EMAIL",
         "CONFLUENCE_MCP_API_KEY",
         "ATLASSIAN_CLOUD_ID",
     ]
+
+
+def test_missing_configuration_includes_atlassian_email_when_unset(monkeypatch):
+    monkeypatch.delenv("ATLASSIAN_EMAIL", raising=False)
+
+    search = AgenticSearch(
+        openai_api_key="test-openai-key",
+        confluence_mcp_api_key="test-mcp-token",
+        atlassian_cloud_id="test-cloud-id",
+    )
+
+    assert search.missing_configuration() == ["ATLASSIAN_EMAIL"]
 
 
 def test_search_returns_configuration_error_when_api_key_is_missing(monkeypatch):
     monkeypatch.delenv("CONFLUENCE_MCP_API_KEY", raising=False)
     search = AgenticSearch(
         openai_api_key="test-openai-key",
+        atlassian_email="bot@example.com",
         atlassian_cloud_id="test-cloud-id",
     )
 
@@ -213,6 +300,7 @@ def test_search_returns_configuration_error_when_cloud_id_is_missing(monkeypatch
     monkeypatch.delenv("ATLASSIAN_CLOUD_ID", raising=False)
     search = AgenticSearch(
         openai_api_key="test-openai-key",
+        atlassian_email="bot@example.com",
         confluence_mcp_api_key="test-mcp-token",
     )
 
@@ -350,6 +438,7 @@ def test_search_uses_explicit_atlassian_cloud_id_for_shared_search_args(
     )
     search = AgenticSearch(
         openai_api_key="test-openai-key",
+        atlassian_email="bot@example.com",
         confluence_mcp_api_key="test-mcp-token",
         atlassian_cloud_id="configured-cloud-id",
         model="gpt-4.1-mini",
@@ -443,6 +532,8 @@ def test_search_omits_debug_block_when_debug_disabled(monkeypatch):
 
 def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
     monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "yes")
+    search = make_search()
+    encoded_credentials = search.mcp_auth_header.removeprefix("Basic ")
     server = FakeServer(
         tools=make_discovered_tools(),
         responses={
@@ -459,12 +550,16 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
                     "api_token": "super-secret-token",
                     "apiToken": "camel-secret-token",
                     "authorization": "Bearer secret-token",
-                    "note": "Authorization=Bearer another-secret-token",
+                    "note": (
+                        "Authorization=Bearer another-secret-token; "
+                        f"email={search.atlassian_email}; "
+                        f"token={search.confluence_mcp_api_key}; "
+                        f"encoded={encoded_credentials}"
+                    ),
                 },
             )
         },
     )
-    search = make_search()
 
     async def fake_runner(agent, prompt, **_kwargs):
         await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
@@ -488,6 +583,11 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
         "method": "list_tools",
         "tool_names": [SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL],
     }
+    sanitized_schemas = {entry["tool_name"]: entry for entry in debug["sanitized_tool_schemas"]}
+    assert set(sanitized_schemas) == {SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL}
+    assert sanitized_schemas[SHARED_SEARCH_TOOL]["stripped_keys"] == ["$.additionalProperties"]
+    assert '"additionalProperties": false' in sanitized_schemas[SHARED_SEARCH_TOOL]["original_schema_preview"]
+    assert "additionalProperties" not in sanitized_schemas[SHARED_SEARCH_TOOL]["sanitized_schema_preview"]
     assert debug["calls"][0]["tool_name"] == SHARED_SEARCH_TOOL
     assert debug["calls"][0]["argument_keys"] == ["query", "cloudId"]
     assert "results" in debug["calls"][0]["response_summary"]["top_level_keys"]
@@ -496,6 +596,9 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
     assert "super-secret-token" not in payload_preview
     assert "camel-secret-token" not in payload_preview
     assert "secret-token" not in payload_preview
+    assert search.atlassian_email not in payload_preview
+    assert search.confluence_mcp_api_key not in payload_preview
+    assert encoded_credentials not in payload_preview
     assert "Bearer" not in payload_preview
     assert "apitoken" not in payload_preview.lower()
     assert "authorization" not in payload_preview.lower()
@@ -717,6 +820,7 @@ def test_local_mode_configures_async_openai_client_and_chat_completions_api(monk
     search = AgenticSearch(
         openai_api_key="",
         llm_base_url="http://localhost:11434/v1",
+        atlassian_email="bot@example.com",
         confluence_mcp_api_key="test-mcp-token",
         atlassian_cloud_id="test-cloud-id",
     )
@@ -769,6 +873,7 @@ def test_local_mode_uses_default_ollama_chat_model_when_openai_model_is_unset(mo
     search = AgenticSearch(
         openai_api_key="",
         llm_base_url="http://localhost:11434/v1",
+        atlassian_email="bot@example.com",
         confluence_mcp_api_key="test-mcp-token",
         atlassian_cloud_id="test-cloud-id",
     )
@@ -826,6 +931,7 @@ def test_local_mode_falls_back_to_plain_text_synthesis_when_structured_output_fa
     search = AgenticSearch(
         openai_api_key="",
         llm_base_url="http://localhost:11434/v1",
+        atlassian_email="bot@example.com",
         confluence_mcp_api_key="test-mcp-token",
         atlassian_cloud_id="test-cloud-id",
     )
