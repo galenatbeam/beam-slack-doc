@@ -39,9 +39,9 @@ load it automatically.
 Required environment variables:
 
 - `CONFLUENCE_MCP_API_KEY` — sent as `Authorization: Bearer <CONFLUENCE_MCP_API_KEY>`
-- `ATLASSIAN_CLOUD_ID` — pins the Atlassian tenant/site for MCP tool calls
+- `ATLASSIAN_CLOUD_ID` — pins the Atlassian tenant/site when the shared Rovo `search` tool accepts `cloudId`
 
-OpenAI-hosted mode also requires:
+Default agentic mode also requires:
 
 - `OPENAI_API_KEY`
 
@@ -78,6 +78,8 @@ In local mode:
 - `OPENAI_API_KEY` is optional; the app uses a safe internal placeholder if it is unset
 - `OPENAI_MODEL` is optional; if unset, the default local chat model is `qwen3:4b-instruct`
 - MCP retrieval still uses the Atlassian Rovo MCP server configuration above; only the LLM backend changes
+- Default behavior is discovery-first: `list_tools()` -> agent tool-calls search/fetch tools -> answer with citations
+- If `list_tools()` fails (including MCP `-32601`), AgenticSearch returns a Confluence authentication error instead of falling back to a static tool allowlist
 
 Run a search from the command line:
 
@@ -100,9 +102,10 @@ AGENTIC_SEARCH_DEBUG=1 python cli_search.py --json "What is Beam Benefits?"
 ```
 
 When enabled, AgenticSearch writes an MCP debug summary to stderr and adds
-`raw_response.debug` to the JSON response. The debug payload includes tool names,
-selected strategy, `cloudId`, call argument keys, and response summaries only—no
-auth headers, API keys, or content body previews.
+`raw_response.debug` to the JSON response. The debug payload includes discovered
+tool names from `list_tools()`, called tool names, call argument keys, and
+response summaries. Auth headers,
+API keys, and content body previews are not logged.
 
 ## Slack endpoints
 

@@ -5,14 +5,16 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from mcp.types import CallToolResult, Tool
 
 from agentic_search import (
     AgenticSearch,
     Citation,
-    CONFLUENCE_SEARCH_TOOL,
-    CONFLUENCE_SEARCH_TOOL_FALLBACK,
+    CONFLUENCE_AUTH_ISSUE_MESSAGE,
     DEFAULT_OLLAMA_CHAT_MODEL,
+    SHARED_FETCH_TOOL,
+    SHARED_SEARCH_TOOL,
     SynthesizedAnswer,
 )
 
@@ -68,10 +70,88 @@ def make_search() -> AgenticSearch:
     )
 
 
+def make_discovered_tools() -> list[Tool]:
+    return [
+        make_tool(
+            SHARED_SEARCH_TOOL,
+            {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer"},
+                "cloudId": {"type": "string"},
+            },
+            required=["query"],
+        ),
+        make_tool(
+            SHARED_FETCH_TOOL,
+            {
+                "ari": {"type": "string"},
+                "cloudId": {"type": "string"},
+            },
+            required=["ari"],
+        ),
+    ]
+
+
+class FakeRunResult:
+    def __init__(self, synthesized: SynthesizedAnswer, final_output: str | None = None):
+        self._synthesized = synthesized
+        self.final_output = final_output or synthesized.answer
+
+    def final_output_as(self, _model, raise_if_incorrect_type=True):
+        return self._synthesized
+
+
+async def invoke_discovered_tools(agent, tool_calls: list[tuple[str, dict]]) -> None:
+    tool_map = {tool.name: tool for tool in agent.tools}
+    for tool_name, arguments in tool_calls:
+        await tool_map[tool_name].on_invoke_tool(None, json.dumps(arguments))
+
+
 def make_tool_not_found_error(message: str = "Method not found") -> RuntimeError:
     error = RuntimeError(message)
     error.error = SimpleNamespace(code=-32601, message=message)
     return error
+
+
+def make_invalid_arguments_error(message: str = "Invalid arguments") -> RuntimeError:
+    error = RuntimeError(message)
+    error.error = SimpleNamespace(code=-32602, message=message)
+    return error
+
+
+@pytest.fixture
+def rovo_search_structured_results_payload() -> CallToolResult:
+    return CallToolResult(
+        content=[],
+        structuredContent={
+            "results": [
+                {
+                    "title": "Beam Benefits Overview",
+                    "webLink": "https://example.com/beam-overview",
+                    "excerpt": "Beam helps employers manage benefits.",
+                    "ari": "ari:cloud:confluence::page/overview",
+                    "id": "overview-1",
+                }
+            ]
+        },
+    )
+
+
+@pytest.fixture
+def rovo_search_ari_only_payload() -> CallToolResult:
+    return CallToolResult(
+        content=[],
+        structuredContent={
+            "items": [
+                {
+                    "name": "Benefits FAQ",
+                    "ari": "ari:cloud:confluence::page/faq",
+                    "entityId": "faq-123",
+                    "summary": "Frequently asked questions about benefits.",
+                }
+            ]
+        },
+    )
 
 
 def test_confluence_mcp_api_key_builds_bearer_auth_header(monkeypatch):
@@ -135,38 +215,52 @@ def test_search_returns_configuration_error_when_cloud_id_is_missing(monkeypatch
     assert result["raw_response"]["missing_variables"] == ["ATLASSIAN_CLOUD_ID"]
 
 
-def test_search_calls_static_confluence_cql_tool_without_list_tools():
+def test_default_mode_lists_tools_and_uses_agent_tool_wrapper(rovo_search_structured_results_payload):
     server = FakeServer(
+        tools=make_discovered_tools(),
         responses={
-            CONFLUENCE_SEARCH_TOOL: CallToolResult(
+            SHARED_SEARCH_TOOL: rovo_search_structured_results_payload,
+            SHARED_FETCH_TOOL: CallToolResult(
                 content=[],
                 structuredContent={
-                    "results": [
-                        {
-                            "title": "Beam Benefits Overview",
-                            "url": "https://example.com/beam-overview",
-                            "excerpt": "Beam helps employers manage benefits.",
-                        }
-                    ]
+                    "title": "Beam Benefits Overview",
+                    "webLink": "https://example.com/beam-overview",
+                    "excerpt": "Detailed fetch result.",
+                    "ari": "ari:cloud:confluence::page/overview",
+                    "id": "overview-1",
+                    "body": "Expanded Beam Benefits documentation.",
                 },
             ),
         },
     )
     search = make_search()
-    search._synthesize_answer = AsyncMock(
-        return_value=SynthesizedAnswer(
-            answer="Beam Benefits offers dental, vision, and supplemental benefits.",
-            citations=[
-                Citation(
-                    title="Beam Benefits Overview",
-                    url="https://example.com/beam-overview",
-                    excerpt="Beam helps employers manage benefits.",
-                )
-            ],
-        )
+    synthesized = SynthesizedAnswer(
+        answer="Beam Benefits offers dental, vision, and supplemental benefits.",
+        citations=[
+            Citation(
+                title="Beam Benefits Overview",
+                url="https://example.com/beam-overview",
+                excerpt="Beam helps employers manage benefits.",
+            )
+        ],
     )
 
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+    async def fake_runner(agent, prompt, **_kwargs):
+        assert prompt == "What is Beam Benefits?"
+        assert {tool.name for tool in agent.tools} == {SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL}
+        await invoke_discovered_tools(
+            agent,
+            [
+                (SHARED_SEARCH_TOOL, {"query": prompt}),
+                (SHARED_FETCH_TOOL, {"ari": "ari:cloud:confluence::page/overview"}),
+            ],
+        )
+        return FakeRunResult(synthesized)
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)) as run_agent,
+    ):
         result = search.search("What is Beam Benefits?")
 
     assert result["answer"].startswith("Beam Benefits offers dental")
@@ -175,38 +269,76 @@ def test_search_calls_static_confluence_cql_tool_without_list_tools():
             "title": "Beam Benefits Overview",
             "url": "https://example.com/beam-overview",
             "excerpt": "Beam helps employers manage benefits.",
+            "identifier": "overview-1",
+            "ari": "ari:cloud:confluence::page/overview",
         }
     ]
     assert result["raw_response"]["status"] == "ok"
-    assert result["raw_response"]["strategy"] == "confluence"
-    assert server.list_tools_calls == 0
+    assert result["raw_response"]["strategy"] == "agentic_discovery"
+    assert server.list_tools_calls == 1
     assert server.calls == [
         (
-            CONFLUENCE_SEARCH_TOOL,
+            SHARED_SEARCH_TOOL,
             {
-                "cql": 'text ~ "What is Beam Benefits?"',
-                "limit": 5,
+                "query": "What is Beam Benefits?",
+                "cloudId": "test-cloud-id",
+            },
+        ),
+        (
+            SHARED_FETCH_TOOL,
+            {
+                "ari": "ari:cloud:confluence::page/overview",
                 "cloudId": "test-cloud-id",
             },
         )
     ]
+    assert result["raw_response"]["selected_tools"] == [SHARED_FETCH_TOOL, SHARED_SEARCH_TOOL]
+    run_agent.assert_awaited_once()
 
 
-def test_search_uses_explicit_atlassian_cloud_id_for_confluence_tool_args():
+def test_default_mode_maps_list_tools_failure_to_confluence_auth_issue(monkeypatch, capsys):
+    monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
+    error = make_tool_not_found_error("Method not found Authorization=Bearer secret-token")
+    error.response = SimpleNamespace(
+        status_code=401,
+        json=lambda: {
+            "error": {
+                "code": -32601,
+                "message": "Forbidden Basic abc123",
+                "data": {"api_token": "top-secret"},
+            }
+        },
+    )
+    server = FakeServer(list_tools_error=error)
+    search = make_search()
+
+    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+        result = search.search("What failed?")
+
+    captured = capsys.readouterr()
+    debug = result["raw_response"]["debug"]
+    serialized = json.dumps(debug).lower()
+    assert result["raw_response"]["status"] == "confluence_authentication_error"
+    assert result["answer"] == CONFLUENCE_AUTH_ISSUE_MESSAGE
+    assert debug["last_step"] == "list_tools"
+    assert debug["http_status"] == 401
+    assert debug["mcp_error_preview"]["code"] == -32601
+    assert "[AgenticSearch debug] error:" in captured.err
+    assert '"last_step": "list_tools"' in captured.err
+    assert "secret-token" not in captured.err
+    assert "abc123" not in captured.err
+    assert "top-secret" not in captured.err
+    assert "authorization" not in serialized
+    assert "api_token" not in serialized
+
+
+def test_search_uses_explicit_atlassian_cloud_id_for_shared_search_args(
+    rovo_search_structured_results_payload,
+):
     server = FakeServer(
+        tools=make_discovered_tools(),
         responses={
-            CONFLUENCE_SEARCH_TOOL: CallToolResult(
-                content=[],
-                structuredContent={
-                    "results": [
-                        {
-                            "title": "Beam Benefits Overview",
-                            "url": "https://example.com/beam-overview",
-                            "excerpt": "Beam helps employers manage benefits.",
-                        }
-                    ]
-                },
-            ),
+            SHARED_SEARCH_TOOL: rovo_search_structured_results_payload,
         },
     )
     search = AgenticSearch(
@@ -215,110 +347,50 @@ def test_search_uses_explicit_atlassian_cloud_id_for_confluence_tool_args():
         atlassian_cloud_id="configured-cloud-id",
         model="gpt-4.1-mini",
     )
-    search._synthesize_answer = AsyncMock(
-        return_value=SynthesizedAnswer(
-            answer="Beam Benefits offers dental, vision, and supplemental benefits.",
-            citations=[
-                Citation(
-                    title="Beam Benefits Overview",
-                    url="https://example.com/beam-overview",
-                )
-            ],
-        )
-    )
 
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        return FakeRunResult(
+            SynthesizedAnswer(
+                answer="Configured cloud ID used.",
+                citations=[Citation(title="Beam Benefits Overview", url="https://example.com/beam-overview")],
+            )
+        )
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
         result = search.search("What is Beam Benefits?")
 
     assert result["raw_response"]["status"] == "ok"
-    assert server.list_tools_calls == 0
+    assert server.list_tools_calls == 1
     assert server.calls == [
         (
-            CONFLUENCE_SEARCH_TOOL,
+            SHARED_SEARCH_TOOL,
             {
-                "cql": 'text ~ "What is Beam Benefits?"',
-                "limit": 5,
+                "query": "What is Beam Benefits?",
                 "cloudId": "configured-cloud-id",
             },
         )
     ]
 
 
-def test_search_falls_back_to_secondary_confluence_tool_when_primary_tool_not_found():
-    server = FakeServer(
-        responses={
-            CONFLUENCE_SEARCH_TOOL_FALLBACK: CallToolResult(
-                content=[],
-                structuredContent={
-                    "results": [
-                        {
-                            "title": "Benefits FAQ",
-                            "url": "https://example.com/faq",
-                            "excerpt": "Frequently asked questions about benefits.",
-                        }
-                    ]
-                },
-            ),
-        },
-        call_errors={CONFLUENCE_SEARCH_TOOL: make_tool_not_found_error()},
-    )
-    search = make_search()
-    search._synthesize_answer = AsyncMock(
-        return_value=SynthesizedAnswer(
-            answer="Employees can review plan information from the benefits portal.",
-            citations=[Citation(title="Benefits FAQ", url="https://example.com/faq")],
-        )
-    )
-
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
-        result = search.search("Where do employees review plan information?")
-
-    assert result["raw_response"]["strategy"] == "confluence"
-    assert server.list_tools_calls == 0
-    assert server.calls == [
-        (
-            CONFLUENCE_SEARCH_TOOL,
-            {
-                "cql": 'text ~ "Where do employees review plan information?"',
-                "limit": 5,
-                "cloudId": "test-cloud-id",
-            },
-        ),
-        (
-            CONFLUENCE_SEARCH_TOOL_FALLBACK,
-            {
-                "cql": 'text ~ "Where do employees review plan information?"',
-                "limit": 5,
-                "cloudId": "test-cloud-id",
-            },
-        ),
-    ]
-
-
-def test_search_returns_no_results_response_when_search_is_empty():
-    server = FakeServer(
-        responses={
-            CONFLUENCE_SEARCH_TOOL: CallToolResult(content=[], structuredContent={"results": []}),
-        },
-    )
-    search = make_search()
-    search._synthesize_answer = AsyncMock()
-
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
-        result = search.search("totally unknown phrase")
-
-    assert result["raw_response"]["status"] == "no_results"
-    assert result["citations"] == []
-    search._synthesize_answer.assert_not_called()
-
-
 def test_search_returns_generic_error_response_when_mcp_tool_fails():
     server = FakeServer(
+        tools=make_discovered_tools(),
         error=RuntimeError("boom"),
     )
     search = make_search()
 
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        raise AssertionError("tool invocation should have failed")
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
         result = search.search("What failed?")
 
     assert result["answer"].startswith("Sorry, I ran into an issue")
@@ -330,8 +402,9 @@ def test_search_returns_generic_error_response_when_mcp_tool_fails():
 def test_search_omits_debug_block_when_debug_disabled(monkeypatch):
     monkeypatch.delenv("AGENTIC_SEARCH_DEBUG", raising=False)
     server = FakeServer(
+        tools=make_discovered_tools(),
         responses={
-            CONFLUENCE_SEARCH_TOOL: CallToolResult(
+            SHARED_SEARCH_TOOL: CallToolResult(
                 content=[],
                 structuredContent={
                     "results": [
@@ -346,14 +419,15 @@ def test_search_omits_debug_block_when_debug_disabled(monkeypatch):
         },
     )
     search = make_search()
-    search._synthesize_answer = AsyncMock(
-        return_value=SynthesizedAnswer(
-            answer="Debug excerpt.",
-            citations=[Citation(title="Debug Doc", url="https://example.com/debug-doc")],
-        )
-    )
 
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        return FakeRunResult(SynthesizedAnswer(answer="Debug excerpt.", citations=[]))
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
         result = search.search("debug me")
 
     assert "debug" not in result["raw_response"]
@@ -362,8 +436,9 @@ def test_search_omits_debug_block_when_debug_disabled(monkeypatch):
 def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
     monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "yes")
     server = FakeServer(
+        tools=make_discovered_tools(),
         responses={
-            CONFLUENCE_SEARCH_TOOL: CallToolResult(
+            SHARED_SEARCH_TOOL: CallToolResult(
                 content=[],
                 structuredContent={
                     "results": [
@@ -379,14 +454,15 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
         },
     )
     search = make_search()
-    search._synthesize_answer = AsyncMock(
-        return_value=SynthesizedAnswer(
-            answer="Debug excerpt.",
-            citations=[Citation(title="Debug Doc", url="https://example.com/debug-doc")],
-        )
-    )
 
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        return FakeRunResult(SynthesizedAnswer(answer="Debug excerpt.", citations=[]))
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
         result = search.search("debug me")
 
     debug = result["raw_response"]["debug"]
@@ -396,11 +472,13 @@ def test_search_includes_redacted_debug_block_when_enabled(monkeypatch):
     assert "api_token" not in serialized
     assert debug["mcp_server_url"] == search.mcp_server_url
     assert debug["mcp_server_name"] == search.mcp_server_name
-    assert debug["tool_discovery"] == {"skipped": True}
-    assert debug["search_tool"] == {
-        "tool_name": CONFLUENCE_SEARCH_TOOL,
-        "argument_keys": ["cql", "limit", "cloudId"],
+    assert debug["tool_discovery"] == {
+        "called": True,
+        "method": "list_tools",
+        "tool_names": [SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL],
     }
+    assert debug["calls"][0]["tool_name"] == SHARED_SEARCH_TOOL
+    assert debug["calls"][0]["argument_keys"] == ["query", "cloudId"]
     assert debug["calls"][0]["response_summary"]["top_level_keys"] == ["results"]
 
 
@@ -417,17 +495,24 @@ def test_search_debug_call_tool_failure_with_http_error_prints_stderr_error_line
             }
         },
     )
-    server = FakeServer(error=error)
+    server = FakeServer(tools=make_discovered_tools(), error=error)
     search = make_search()
 
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        raise AssertionError("tool invocation should have failed")
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
         result = search.search("What failed?")
 
     captured = capsys.readouterr()
     debug = result["raw_response"]["debug"]
     serialized = json.dumps(debug).lower()
     assert result["raw_response"]["status"] == "search_error"
-    assert debug["last_step"] == f"call_tool:{CONFLUENCE_SEARCH_TOOL}"
+    assert debug["last_step"] == f"call_tool:{SHARED_SEARCH_TOOL}"
     assert debug["http_status"] == 403
     assert debug["mcp_error_preview"]["code"] == 403
     assert "tool call failed" in debug["error_message"]
@@ -448,10 +533,17 @@ def test_search_debug_redacts_json_string_http_response_body(monkeypatch, capsys
         status_code=403,
         text='{"api_token":"top-secret","Authorization":"Bearer secret-token","mode":"Basic abc123"}',
     )
-    server = FakeServer(error=error)
+    server = FakeServer(tools=make_discovered_tools(), error=error)
     search = make_search()
 
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        raise AssertionError("tool invocation should have failed")
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
         result = search.search("What failed?")
 
     captured = capsys.readouterr()
@@ -478,18 +570,26 @@ def test_search_debug_redacts_json_string_http_response_body(monkeypatch, capsys
 def test_search_debug_call_tool_failure_prints_stderr_error_line(monkeypatch, capsys):
     monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
     server = FakeServer(
+        tools=make_discovered_tools(),
         error=RuntimeError("boom Authorization=Bearer secret-token"),
     )
     search = make_search()
 
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        raise AssertionError("tool invocation should have failed")
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
         result = search.search("What failed?")
 
     captured = capsys.readouterr()
     debug = result["raw_response"]["debug"]
     serialized = json.dumps(debug).lower()
     assert result["raw_response"]["status"] == "search_error"
-    assert debug["last_step"] == f"call_tool:{CONFLUENCE_SEARCH_TOOL}"
+    assert debug["last_step"] == f"call_tool:{SHARED_SEARCH_TOOL}"
     assert debug["error_type"] == "RuntimeError"
     assert "boom" in debug["error_message"]
     assert '"error_message": "boom [REDACTED_AUTH]"' in captured.err
@@ -503,8 +603,9 @@ def test_search_debug_call_tool_failure_prints_stderr_error_line(monkeypatch, ca
 def test_debug_response_summary_includes_redacted_error_text_for_error_payload(monkeypatch):
     monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
     server = FakeServer(
+        tools=make_discovered_tools(),
         responses={
-            CONFLUENCE_SEARCH_TOOL: SimpleNamespace(
+            SHARED_SEARCH_TOOL: SimpleNamespace(
                 isError=True,
                 structuredContent={
                     "message": "Bad request Authorization=Bearer hidden-token",
@@ -516,12 +617,19 @@ def test_debug_response_summary_includes_redacted_error_text_for_error_payload(m
     )
     search = make_search()
 
-    with patch("agentic_search.MCPServerStreamableHttp", return_value=server):
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        return FakeRunResult(SynthesizedAnswer(answer="Bad request surfaced.", citations=[]))
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
         result = search.search("debug me")
 
     summary = result["raw_response"]["debug"]["calls"][0]["response_summary"]
     serialized = json.dumps(summary).lower()
-    assert result["raw_response"]["status"] == "no_results"
+    assert result["raw_response"]["status"] == "ok"
     assert summary["is_error"] is True
     assert "Bad request" in summary["error_text"]
     assert "hidden-token" not in serialized
@@ -529,10 +637,12 @@ def test_debug_response_summary_includes_redacted_error_text_for_error_payload(m
     assert "api_token" not in serialized
 
 
-def test_local_mode_configures_async_openai_client_and_chat_completions_api():
+def test_local_mode_configures_async_openai_client_and_chat_completions_api(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     server = FakeServer(
+        tools=make_discovered_tools(),
         responses={
-            CONFLUENCE_SEARCH_TOOL: CallToolResult(
+            SHARED_SEARCH_TOOL: CallToolResult(
                 content=[],
                 structuredContent={
                     "results": [
@@ -552,20 +662,33 @@ def test_local_mode_configures_async_openai_client_and_chat_completions_api():
         confluence_mcp_api_key="test-mcp-token",
         atlassian_cloud_id="test-cloud-id",
     )
-    search._synthesize_answer = AsyncMock(
-        return_value=SynthesizedAnswer(
-            answer="Local mode works.",
-            citations=[
-                Citation(
-                    title="Local Mode Doc",
-                    url="https://example.com/local-mode",
-                )
-            ],
-        )
+    synthesized = SynthesizedAnswer(
+        answer="Local mode works.",
+        citations=[
+            Citation(
+                title="Local Mode Doc",
+                url="https://example.com/local-mode",
+            )
+        ],
     )
+
+    async def fake_runner(agent, prompt, **_kwargs):
+        tool = next(tool for tool in agent.tools if tool.name == SHARED_SEARCH_TOOL)
+        await tool.on_invoke_tool(
+            None,
+            json.dumps(
+                {
+                    "query": prompt,
+                    "max_results": 5,
+                    "cloudId": "test-cloud-id",
+                }
+            ),
+        )
+        return FakeRunResult(synthesized)
 
     with (
         patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
         patch("agentic_search.set_default_openai_client") as set_client,
         patch("agentic_search.set_default_openai_api") as set_api,
         patch("agentic_search.set_tracing_disabled") as set_tracing_disabled,
@@ -593,6 +716,52 @@ def test_local_mode_uses_default_ollama_chat_model_when_openai_model_is_unset(mo
     )
 
     assert search.model == DEFAULT_OLLAMA_CHAT_MODEL
+
+
+def test_normalize_documents_handles_rovo_ari_only_results(rovo_search_ari_only_payload):
+    search = make_search()
+
+    documents = search._normalize_documents(rovo_search_ari_only_payload, source=SHARED_SEARCH_TOOL)
+
+    assert len(documents) == 1
+    assert documents[0].title == "Benefits FAQ"
+    assert documents[0].url is None
+    assert documents[0].identifier == "faq-123"
+    assert documents[0].ari == "ari:cloud:confluence::page/faq"
+    assert documents[0].excerpt == "Frequently asked questions about benefits."
+
+
+def test_search_falls_back_to_ari_citation_when_url_is_missing(rovo_search_ari_only_payload):
+    server = FakeServer(
+        tools=make_discovered_tools(),
+        responses={SHARED_SEARCH_TOOL: rovo_search_ari_only_payload},
+    )
+    search = make_search()
+
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        return FakeRunResult(
+            SynthesizedAnswer(
+                answer="Benefits FAQ covers common enrollment questions.",
+                citations=[],
+            )
+        )
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
+        result = search.search("Where is the FAQ?")
+
+    assert result["citations"] == [
+        {
+            "title": "Benefits FAQ",
+            "url": None,
+            "excerpt": "Frequently asked questions about benefits.",
+            "identifier": "faq-123",
+            "ari": "ari:cloud:confluence::page/faq",
+        }
+    ]
 
 
 def test_local_mode_falls_back_to_plain_text_synthesis_when_structured_output_fails():

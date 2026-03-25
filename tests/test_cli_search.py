@@ -129,7 +129,7 @@ def test_main_prints_debug_failure_summary_to_stderr_without_json(monkeypatch, c
                 "raw_response": {
                     "status": "search_error",
                     "debug": {
-                        "last_step": "list_tools",
+                        "last_step": "call_tool:search",
                         "error_type": "RuntimeError",
                         "error_message": "boom",
                         "http_status": 403,
@@ -146,8 +146,39 @@ def test_main_prints_debug_failure_summary_to_stderr_without_json(monkeypatch, c
     assert exit_code == 0
     assert "Sorry, search failed." in captured.out
     assert "[AgenticSearch debug] result:" in captured.err
-    assert '"last_step": "list_tools"' in captured.err
+    assert '"last_step": "call_tool:search"' in captured.err
     assert '"error_message": "boom"' in captured.err
+
+
+def test_main_prints_ari_when_citation_has_no_url(monkeypatch, capsys):
+    class FakeSearch:
+        def __init__(self):
+            self.openai_api_key = "test-openai-key"
+            self.confluence_mcp_api_key = "test-token"
+            self.atlassian_cloud_id = "test-cloud-id"
+
+        def search(self, query: str):
+            assert query == "query"
+            return {
+                "answer": "Found a result without a URL.",
+                "citations": [
+                    {
+                        "title": "Benefits FAQ",
+                        "url": None,
+                        "ari": "ari:cloud:confluence::page/faq",
+                    }
+                ],
+                "raw_response": {"status": "ok"},
+            }
+
+    monkeypatch.setattr(cli_search, "load_dotenv", lambda: None)
+    monkeypatch.setattr(cli_search, "AgenticSearch", FakeSearch)
+
+    exit_code = cli_search.main(["query"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Benefits FAQ: ari:cloud:confluence::page/faq" in captured.out
 
 
 def test_parser_uses_exit_code_two_for_invalid_usage():

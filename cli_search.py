@@ -18,10 +18,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Required MCP config: CONFLUENCE_MCP_API_KEY and ATLASSIAN_CLOUD_ID. "
             "MCP_SERVER_URL is optional and defaults to https://mcp.atlassian.com/v1/mcp. "
-            "Also set either "
+            "Search also requires either "
             "OPENAI_API_KEY (OpenAI-hosted mode) or LLM_BASE_URL=http://localhost:11434/v1 "
-            "(local Ollama mode; OPENAI_API_KEY optional). Optional: OPENAI_MODEL, "
-            "CONFLUENCE_SPACE, MCP_SERVER_URL, MCP_SERVER_NAME. Set "
+            "(local Ollama mode; OPENAI_API_KEY optional). Optional: "
+            "OPENAI_MODEL, CONFLUENCE_SPACE, MCP_SERVER_URL, MCP_SERVER_NAME. Set "
             "AGENTIC_SEARCH_DEBUG=1 (also true/yes) to emit MCP debug summaries "
             "to stderr and include raw_response.debug in --json output without printing "
             "auth headers or API keys."
@@ -38,12 +38,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _missing_config(search: AgenticSearch) -> list[str]:
+    if hasattr(search, "missing_configuration"):
+        return search.missing_configuration()
+
     missing: list[str] = []
-    if not search.openai_api_key:
+    if not getattr(search, "openai_api_key", ""):
         missing.append("OPENAI_API_KEY")
-    if not search.confluence_mcp_api_key:
+    if not getattr(search, "confluence_mcp_api_key", ""):
         missing.append("CONFLUENCE_MCP_API_KEY")
-    if not search.atlassian_cloud_id:
+    if not getattr(search, "atlassian_cloud_id", ""):
         missing.append("ATLASSIAN_CLOUD_ID")
     return missing
 
@@ -58,8 +61,8 @@ def _print_default_output(result: dict) -> None:
 
     for citation in citations:
         title = citation.get("title", "Untitled")
-        url = citation.get("url", "")
-        print(f"- {title}: {url}")
+        reference = citation.get("url") or citation.get("ari") or citation.get("identifier")
+        print(f"- {title}: {reference or '(no link available)'}")
 
 
 def _print_failure_debug(result: dict) -> None:

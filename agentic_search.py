@@ -18,6 +18,7 @@ from agents import (
     set_tracing_disabled,
 )
 from agents.mcp import MCPServerStreamableHttp
+from agents.tool import FunctionTool
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -45,6 +46,11 @@ ATLASSIAN_CLOUD_ID_ENV = "ATLASSIAN_CLOUD_ID"
 DEBUG_ENV_VAR = "AGENTIC_SEARCH_DEBUG"
 DEBUG_TRUE_VALUES = {"1", "true", "yes"}
 ERROR_PREVIEW_CHAR_LIMIT = 300
+TOOL_CONTENT_CHAR_LIMIT = 4000
+CONFLUENCE_AUTH_ISSUE_MESSAGE = (
+    "Confluence authentication issue. Please verify the Atlassian MCP "
+    "credentials and try again."
+)
 SENSITIVE_DEBUG_KEYS = {
     "api_key",
     "api_token",
@@ -200,72 +206,231 @@ class AgenticSearch:
         except Exception as exc:  # pragma: no cover - exercised via public response path
             return self._error_response(clean_query, "search_error", exc)
 
-    def build_agent_instructions(self) -> str:
+    def build_agent_instructions(self, discovered_tool_names: Sequence[str] | None = None) -> str:
         """Instruction template for the answer-synthesis agent."""
         scope = ""
         if self.confluence_space:
             scope = f" Favor documents from Confluence space '{self.confluence_space}'."
 
+        tool_guidance = ""
+        if discovered_tool_names:
+            tool_guidance = " Available MCP tools: " + ", ".join(discovered_tool_names) + "."
+
         return (
-            "You are a documentation search assistant. You are given documentation that was "
-            "already retrieved through MCP tools. Answer only from the provided documents. "
-            "Keep the answer concise, say clearly when the docs do not fully answer the query, "
-            "and cite only provided documents using title + URL when available, otherwise "
-            "title + ARI/ID." + scope
+            "You are a documentation search assistant. Use the discovered MCP tools to answer "
+            "the user's question. Start with a search-style tool to find relevant documents. "
+            "If a fetch/get tool could improve the answer, call it for the most relevant result. "
+            "Rank the evidence, answer only from tool-returned documents, keep the answer "
+            "concise, and clearly say when the docs do not fully answer the query. Return "
+            "citations using title + URL when available, otherwise title + ARI/ID."
+            + tool_guidance
+            + scope
         )
 
     async def _search_async(self, query: str) -> Dict[str, Any]:
+        return await self._search_agentic_async(query)
+
+    async def _search_agentic_async(self, query: str) -> Dict[str, Any]:
         self._configure_agents_sdk()
 
         self._set_last_step("mcp_connect")
         async with self._build_mcp_server() as server:
-            self._record_debug(
-                "tool_discovery",
-                {"skipped": True, "method": "list_tools"},
-            )
-            search_tool, search_payload = await self._call_shared_search_tool(
+            try:
+                discovered_tools = await self._list_tools(server)
+            except Exception as exc:
+                return self._confluence_auth_issue_response(query, exc)
+
+            if not discovered_tools:
+                raise RuntimeError("No MCP tools were discovered.")
+
+            collected_documents: list[DocumentResult] = []
+            agent_tools = self._build_discovered_function_tools(
                 server,
-                self._build_shared_search_argument_candidates(query),
+                discovered_tools,
+                collected_documents,
             )
-            documents = self._normalize_documents(search_payload, source=search_tool)
 
-            if not documents:
-                raw_response = {
-                    "status": "no_results",
-                    "strategy": "shared_search",
-                    "model": self.model,
-                    "query": query,
-                    "selected_tools": [search_tool],
-                }
-                return {
-                    "answer": (
-                        f"I couldn't find relevant documentation for '{query}'. Try adding more "
-                        "specific keywords, a product name, or a team-specific term."
-                    ),
-                    "citations": [],
-                    "raw_response": self._with_debug(raw_response),
-                }
-
-            self._set_last_step("synthesis")
-            synthesized = await self._synthesize_answer(query, documents)
-            citations = self._normalize_citations(synthesized.citations, documents)
+            self._set_last_step("agent_run")
+            synthesized = await self._run_tool_calling_agent(
+                query,
+                agent_tools,
+                [tool.name for tool in discovered_tools if getattr(tool, "name", None)],
+                collected_documents,
+            )
+            citations = self._normalize_citations(synthesized.citations, collected_documents)
 
             if not citations:
-                citations = self._fallback_citations(documents)
+                citations = self._fallback_citations(collected_documents)
 
             raw_response = {
                 "status": "ok",
-                "strategy": "shared_search",
+                "strategy": "agentic_discovery",
                 "model": self.model,
                 "query": query,
-                "selected_tools": [search_tool],
-                "fetch_errors": [],
+                "discovered_tools": [tool.name for tool in discovered_tools if getattr(tool, "name", None)],
+                "selected_tools": sorted({document.source for document in collected_documents}),
             }
             return {
                 "answer": synthesized.answer.strip(),
                 "citations": [citation.model_dump() for citation in citations],
                 "raw_response": self._with_debug(raw_response),
             }
+
+    async def _list_tools(self, server: Any) -> list[Any]:
+        self._set_last_step("list_tools")
+        tools_result = await server.list_tools()
+        tools = getattr(tools_result, "tools", tools_result)
+        discovered_tools = list(tools or [])
+        self._record_debug(
+            "tool_discovery",
+            {
+                "called": True,
+                "method": "list_tools",
+                "tool_names": [tool.name for tool in discovered_tools if getattr(tool, "name", None)],
+            },
+        )
+        return discovered_tools
+
+    def _build_discovered_function_tools(
+        self,
+        server: Any,
+        discovered_tools: Sequence[Any],
+        collected_documents: list[DocumentResult],
+    ) -> list[FunctionTool]:
+        return [
+            self._build_discovered_function_tool(server, tool, collected_documents)
+            for tool in discovered_tools
+            if getattr(tool, "name", None)
+        ]
+
+    def _build_discovered_function_tool(
+        self,
+        server: Any,
+        tool: Any,
+        collected_documents: list[DocumentResult],
+    ) -> FunctionTool:
+        tool_name = tool.name
+        description = getattr(tool, "description", None) or f"MCP tool '{tool_name}'."
+        params_json_schema = getattr(tool, "inputSchema", None) or {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+
+        async def on_invoke_tool(_ctx: Any, input_json: str) -> str:
+            arguments = self._prepare_discovered_tool_arguments(
+                tool,
+                self._parse_tool_input(input_json),
+            )
+            payload = await self._call_tool(server, tool_name, arguments)
+            documents = self._normalize_documents(payload, source=tool_name)
+            collected_documents.extend(documents)
+            result: dict[str, Any] = {
+                "tool_name": tool_name,
+                "documents": [self._document_tool_view(document) for document in documents],
+            }
+            extracted = self._extract_payload(payload)
+            text_blob = self._extract_text_blob(extracted)
+            if text_blob and not documents:
+                result["content"] = self._truncate_text(text_blob, TOOL_CONTENT_CHAR_LIMIT)
+            return json.dumps(result, ensure_ascii=False)
+
+        return FunctionTool(
+            name=tool_name,
+            description=description,
+            params_json_schema=params_json_schema,
+            on_invoke_tool=on_invoke_tool,
+        )
+
+    def _parse_tool_input(self, input_json: str) -> dict[str, Any]:
+        stripped = input_json.strip()
+        if not stripped or stripped == "null":
+            return {}
+        parsed = json.loads(stripped)
+        if parsed is None:
+            return {}
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Tool arguments must be a JSON object.")
+        return parsed
+
+    def _prepare_discovered_tool_arguments(
+        self,
+        tool: Any,
+        arguments: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        prepared = dict(arguments)
+        if (
+            self.atlassian_cloud_id
+            and self._tool_accepts_param(tool, "cloudId")
+            and "cloudId" not in prepared
+        ):
+            prepared["cloudId"] = self.atlassian_cloud_id
+        return prepared
+
+    async def _run_tool_calling_agent(
+        self,
+        query: str,
+        tools: Sequence[FunctionTool],
+        discovered_tool_names: Sequence[str],
+        collected_documents: Sequence[DocumentResult],
+    ) -> SynthesizedAnswer:
+        try:
+            return await self._run_tool_calling_agent_structured(query, tools, discovered_tool_names)
+        except Exception:
+            if not self.uses_local_llm:
+                raise
+            return await self._run_tool_calling_agent_plain_text(
+                query,
+                tools,
+                discovered_tool_names,
+                collected_documents,
+            )
+
+    async def _run_tool_calling_agent_structured(
+        self,
+        query: str,
+        tools: Sequence[FunctionTool],
+        discovered_tool_names: Sequence[str],
+    ) -> SynthesizedAnswer:
+        agent = Agent(
+            name="AgenticSearch",
+            instructions=self.build_agent_instructions(discovered_tool_names),
+            model=self.model,
+            tools=list(tools),
+            output_type=SynthesizedAnswer,
+        )
+        result = await Runner.run(agent, query)
+        return result.final_output_as(SynthesizedAnswer, raise_if_incorrect_type=True)
+
+    async def _run_tool_calling_agent_plain_text(
+        self,
+        query: str,
+        tools: Sequence[FunctionTool],
+        discovered_tool_names: Sequence[str],
+        collected_documents: Sequence[DocumentResult],
+    ) -> SynthesizedAnswer:
+        agent = Agent(
+            name="AgenticSearch",
+            instructions=(
+                self.build_agent_instructions(discovered_tool_names)
+                + " Return a concise plain-text answer only. Do not emit JSON or XML."
+            ),
+            model=self.model,
+            tools=list(tools),
+        )
+        result = await Runner.run(agent, query)
+        answer = getattr(result, "final_output", None)
+        answer_text = answer if isinstance(answer, str) else str(answer or "")
+        answer_text = answer_text.strip()
+        if not answer_text:
+            answer_text = (
+                "I found relevant documentation, but the local model did not return a usable "
+                "structured answer."
+            )
+        return SynthesizedAnswer(
+            answer=answer_text,
+            citations=self._fallback_citations(collected_documents),
+        )
 
     def _build_mcp_server(self) -> MCPServerStreamableHttp:
         return MCPServerStreamableHttp(
@@ -836,6 +1001,12 @@ class AgenticSearch:
             "source": document.source,
         }
 
+    def _document_tool_view(self, document: DocumentResult) -> dict[str, Any]:
+        tool_view = self._document_prompt_view(document)
+        tool_view["identifier"] = document.identifier
+        tool_view["ari"] = document.ari
+        return tool_view
+
     def _document_debug_view(self, document: DocumentResult) -> dict[str, Any]:
         debug_document = asdict(document)
         debug_document.pop("content", None)
@@ -1165,10 +1336,23 @@ class AgenticSearch:
         return {
             "answer": (
                 "Search is not configured correctly right now. Please verify the required "
-                "OpenAI and MCP environment variables and try again."
+                "environment variables and try again."
             ),
             "citations": [],
             "raw_response": self._with_debug(raw_response),
+        }
+
+    def _confluence_auth_issue_response(self, query: str, exc: Exception) -> Dict[str, Any]:
+        raw_response = {
+            "status": "confluence_authentication_error",
+            "query": query,
+            "model": self.model,
+            "error_type": type(exc).__name__,
+        }
+        return {
+            "answer": CONFLUENCE_AUTH_ISSUE_MESSAGE,
+            "citations": [],
+            "raw_response": self._with_debug(raw_response, exc),
         }
 
     def _error_response(
