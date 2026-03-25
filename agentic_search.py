@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -42,6 +43,7 @@ ID_KEYS = ("id", "pageId", "contentId", "entityId")
 ARI_KEYS = ("ari", "resourceAri", "resourceARI", "resourceId")
 CONTENT_KEYS = ("body", "content", "markdown", "value")
 CONFLUENCE_MCP_API_KEY_ENV = "CONFLUENCE_MCP_API_KEY"
+ATLASSIAN_EMAIL_ENV = "ATLASSIAN_EMAIL"
 ATLASSIAN_CLOUD_ID_ENV = "ATLASSIAN_CLOUD_ID"
 DEBUG_ENV_VAR = "AGENTIC_SEARCH_DEBUG"
 DEBUG_TRUE_VALUES = {"1", "true", "yes"}
@@ -53,9 +55,11 @@ CONFLUENCE_AUTH_ISSUE_MESSAGE = (
     "credentials and try again."
 )
 SENSITIVE_DEBUG_KEYS = {
+    "atlassian_email",
     "api_key",
     "api_token",
     "authorization",
+    "email",
     "headers",
     "password",
     "secret",
@@ -71,12 +75,18 @@ AUTH_TEXT_PATTERNS = (
 
 def build_mcp_auth_header(
     api_key: str | None = None,
+    email: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> str:
-    """Build the Atlassian MCP Authorization header from the MCP API key."""
+    """Build the Atlassian MCP Authorization header from email + API token."""
     resolved_env = env or os.environ
+    resolved_email = (email or resolved_env.get(ATLASSIAN_EMAIL_ENV, "")).strip()
     resolved_api_key = (api_key or resolved_env.get(CONFLUENCE_MCP_API_KEY_ENV, "")).strip()
-    return f"Bearer {resolved_api_key}" if resolved_api_key else ""
+    if not resolved_email or not resolved_api_key:
+        return ""
+    credentials = f"{resolved_email}:{resolved_api_key}".encode("utf-8")
+    encoded_credentials = base64.b64encode(credentials).decode("ascii")
+    return f"Basic {encoded_credentials}"
 
 
 def _env_flag(value: str | None) -> bool:
@@ -146,6 +156,7 @@ class AgenticSearch:
         llm_base_url: str | None = None,
         mcp_server_url: str | None = None,
         confluence_mcp_api_key: str | None = None,
+        atlassian_email: str | None = None,
         atlassian_cloud_id: str | None = None,
         max_results: int = 5,
     ) -> None:
@@ -162,10 +173,16 @@ class AgenticSearch:
         self.mcp_server_url = mcp_server_url or os.getenv(
             "MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL
         )
+        self.atlassian_email = (
+            atlassian_email or os.getenv(ATLASSIAN_EMAIL_ENV, "")
+        ).strip()
         self.confluence_mcp_api_key = (
             confluence_mcp_api_key or os.getenv(CONFLUENCE_MCP_API_KEY_ENV, "")
         ).strip()
-        self.mcp_auth_header = build_mcp_auth_header(self.confluence_mcp_api_key)
+        self.mcp_auth_header = build_mcp_auth_header(
+            api_key=self.confluence_mcp_api_key,
+            email=self.atlassian_email,
+        )
         self.atlassian_cloud_id = (
             atlassian_cloud_id or os.getenv(ATLASSIAN_CLOUD_ID_ENV, "")
         ).strip()
@@ -182,6 +199,8 @@ class AgenticSearch:
         missing: list[str] = []
         if not self.uses_local_llm and not self.openai_api_key:
             missing.append("OPENAI_API_KEY")
+        if not self.atlassian_email:
+            missing.append(ATLASSIAN_EMAIL_ENV)
         if not self.confluence_mcp_api_key:
             missing.append(CONFLUENCE_MCP_API_KEY_ENV)
         if not self.atlassian_cloud_id:
@@ -1156,6 +1175,24 @@ class AgenticSearch:
             return self._redact_text(value)
         return value
 
+    def _secret_debug_fragments(self) -> tuple[str, ...]:
+        fragments = {
+            fragment.strip()
+            for fragment in (
+                self.atlassian_email,
+                self.confluence_mcp_api_key,
+                self.mcp_auth_header,
+                self.mcp_auth_header.removeprefix("Basic ")
+                if self.mcp_auth_header.startswith("Basic ")
+                else "",
+                f"{self.atlassian_email}:{self.confluence_mcp_api_key}"
+                if self.atlassian_email and self.confluence_mcp_api_key
+                else "",
+            )
+            if fragment and fragment.strip()
+        }
+        return tuple(sorted(fragments, key=len, reverse=True))
+
     def _redact_text(self, text: str) -> str:
         sanitized_json = self._sanitize_json_text(text)
         if sanitized_json is not None:
@@ -1164,6 +1201,8 @@ class AgenticSearch:
         redacted = text
         for pattern, replacement in AUTH_TEXT_PATTERNS:
             redacted = pattern.sub(replacement, redacted)
+        for secret in self._secret_debug_fragments():
+            redacted = redacted.replace(secret, "[REDACTED_SECRET]")
         return redacted
 
     def _sanitize_json_text(self, text: str) -> str | None:
