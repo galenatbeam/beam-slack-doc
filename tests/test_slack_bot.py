@@ -244,6 +244,32 @@ def test_handle_message_event_ignores_message_subtypes():
     assert fake_search.queries == []
 
 
+def test_handle_message_event_ignores_bot_message_subtype():
+    bot, fake_search, executor = make_bot()
+    client = FakeSlackClient()
+
+    bot.handle_message_event(
+        event={
+            "channel": "C123",
+            "channel_type": "channel",
+            "subtype": "bot_message",
+            "ts": "171.001",
+            "text": "What is Beam?",
+            "bot_id": "B999",
+        },
+        body={
+            "event_id": "evt-message-bot-subtype",
+            "authorizations": [{"user_id": "B123"}],
+        },
+        client=client,
+    )
+
+    assert executor.submissions == []
+    assert client.post_calls == []
+    assert client.update_calls == []
+    assert fake_search.queries == []
+
+
 def test_handle_message_event_ignores_bot_messages():
     bot, fake_search, executor = make_bot()
     client = FakeSlackClient()
