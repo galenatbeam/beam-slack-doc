@@ -643,11 +643,21 @@ class AgenticSearch:
         arguments: Mapping[str, Any],
     ) -> dict[str, Any]:
         prepared = dict(arguments)
-        if (
-            self.atlassian_cloud_id
-            and self._tool_accepts_param(tool, "cloudId")
-            and "cloudId" not in prepared
-        ):
+        if self.atlassian_cloud_id and self._tool_accepts_param(tool, "cloudId"):
+            provided_cloud_id = prepared.get("cloudId")
+            if (
+                "cloudId" in prepared
+                and isinstance(provided_cloud_id, str)
+                and provided_cloud_id != self.atlassian_cloud_id
+            ):
+                self._record_debug_warning(
+                    {
+                        "warning_type": "cloud_id_override",
+                        "tool_name": getattr(tool, "name", None),
+                        "provided_cloud_id": "[REDACTED]",
+                        "configured_cloud_id": "[REDACTED]",
+                    }
+                )
             prepared["cloudId"] = self.atlassian_cloud_id
         return prepared
 
@@ -1439,6 +1449,17 @@ class AgenticSearch:
             self._debug_state.setdefault("calls", []).append(sanitized)
         print(
             f"[AgenticSearch debug] call_tool: {json.dumps(sanitized, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+
+    def _record_debug_warning(self, details: Mapping[str, Any]) -> None:
+        if not self.debug_enabled:
+            return
+        sanitized = self._sanitize_debug_object(dict(details))
+        if self._debug_state is not None:
+            self._debug_state.setdefault("warnings", []).append(sanitized)
+        print(
+            f"[AgenticSearch debug] warning: {json.dumps(sanitized, ensure_ascii=False)}",
             file=sys.stderr,
         )
 

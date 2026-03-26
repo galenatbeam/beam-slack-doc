@@ -626,6 +626,68 @@ def test_search_uses_explicit_atlassian_cloud_id_for_shared_search_args(
     ]
 
 
+def test_search_overrides_model_supplied_cloud_id_with_configured_cloud_id(
+    monkeypatch,
+    capsys,
+    rovo_search_structured_results_payload,
+):
+    monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
+    server = FakeServer(
+        tools=make_discovered_tools(),
+        responses={
+            SHARED_SEARCH_TOOL: rovo_search_structured_results_payload,
+        },
+    )
+    search = AgenticSearch(
+        openai_api_key="test-openai-key",
+        atlassian_email="bot@example.com",
+        confluence_mcp_api_key="test-mcp-token",
+        atlassian_cloud_id="configured-cloud-id",
+        model="gpt-4.1-mini",
+    )
+
+    async def fake_runner(agent, prompt, **_kwargs):
+        await invoke_discovered_tools(
+            agent,
+            [(SHARED_SEARCH_TOOL, {"query": prompt, "cloudId": "model-cloud-id"})],
+        )
+        return FakeRunResult(
+            SynthesizedAnswer(
+                answer="Configured cloud ID overrode the model value.",
+                citations=[Citation(title="Beam Benefits Overview", url="https://example.com/beam-overview")],
+            )
+        )
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
+        result = search.search("What is Beam Benefits?")
+
+    captured = capsys.readouterr()
+    assert result["raw_response"]["status"] == "ok"
+    assert server.calls == [
+        (
+            SHARED_SEARCH_TOOL,
+            {
+                "query": "What is Beam Benefits?",
+                "cloudId": "configured-cloud-id",
+            },
+        )
+    ]
+    assert result["raw_response"]["debug"]["warnings"] == [
+        {
+            "warning_type": "cloud_id_override",
+            "tool_name": SHARED_SEARCH_TOOL,
+            "provided_cloud_id": "[REDACTED]",
+            "configured_cloud_id": "[REDACTED]",
+        }
+    ]
+    assert "[AgenticSearch debug] warning:" in captured.err
+    assert "model-cloud-id" not in captured.err
+    assert "configured-cloud-id" not in captured.err
+
+
 def test_search_returns_generic_error_response_when_mcp_tool_fails():
     server = FakeServer(
         tools=make_discovered_tools(),
