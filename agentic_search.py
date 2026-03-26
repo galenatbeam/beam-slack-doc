@@ -34,8 +34,19 @@ LOCAL_LLM_API_KEY_PLACEHOLDER = "ollama"
 MAX_FETCH_RESULTS = 3
 SHARED_SEARCH_TOOL = "search"
 SHARED_FETCH_TOOL = "fetch"
+ALLOWED_AGENT_TOOL_NAMES = frozenset({SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL})
 CONFLUENCE_SEARCH_TOOL = "searchConfluenceUsingCql"
 CONFLUENCE_FETCH_TOOL = "getConfluencePage"
+MAX_AGENT_RUN_ATTEMPTS = 2
+REQUIRED_SEARCH_TOOL_MISSING_MESSAGE = (
+    "Required Rovo shared tool `search` was not discovered from the MCP server. "
+    "Please verify Rovo tool availability and try again."
+)
+REQUIRED_SEARCH_TOOL_NOT_CALLED_MESSAGE = (
+    "The documentation agent did not call the required Rovo `search` tool. "
+    "Please try again. If this keeps happening, enable AGENTIC_SEARCH_DEBUG=1 "
+    "to inspect tool-calling behavior."
+)
 TITLE_KEYS = ("title", "name", "pageTitle")
 URL_KEYS = ("url", "webLink", "link", "pageUrl")
 EXCERPT_KEYS = ("excerpt", "snippet", "summary", "text")
@@ -147,6 +158,15 @@ class DocumentResult:
     source: str = "search"
 
 
+@dataclass
+class AgentRunOutcome:
+    """Successful agent run outcome after search-tool enforcement."""
+
+    synthesized: SynthesizedAnswer
+    collected_documents: list[DocumentResult]
+    run_used: int
+
+
 class AgenticSearch:
     """Search documentation via Atlassian Rovo MCP and synthesize a cited answer."""
 
@@ -236,7 +256,12 @@ class AgenticSearch:
         except Exception as exc:  # pragma: no cover - exercised via public response path
             return self._error_response(clean_query, "search_error", exc)
 
-    def build_agent_instructions(self, discovered_tool_names: Sequence[str] | None = None) -> str:
+    def build_agent_instructions(
+        self,
+        discovered_tool_names: Sequence[str] | None = None,
+        *,
+        run_number: int = 1,
+    ) -> str:
         """Instruction template for the answer-synthesis agent."""
         scope = ""
         if self.confluence_space:
@@ -246,15 +271,22 @@ class AgenticSearch:
         if discovered_tool_names:
             tool_guidance = " Available MCP tools: " + ", ".join(discovered_tool_names) + "."
 
+        retry_guidance = ""
+        if run_number > 1:
+            retry_guidance = (
+                " This is a retry because the previous run returned without calling `search`."
+            )
+
         return (
-            "You are a documentation search assistant. Use the discovered MCP tools to answer "
-            "the user's question. Start with a search-style tool to find relevant documents. "
-            "If a fetch/get tool could improve the answer, call it for the most relevant result. "
+            "You are a documentation search assistant. You MUST call the MCP tool named `search` "
+            "at least once before giving a final answer. Do not answer from prior knowledge or "
+            "without tool results. Use `fetch` only if it improves the answer for the most relevant result. "
             "Rank the evidence, answer only from tool-returned documents, keep the answer "
             "concise, and clearly say when the docs do not fully answer the query. Return "
             "citations using title + URL when available, otherwise title + ARI/ID."
             + tool_guidance
             + scope
+            + retry_guidance
         )
 
     async def _search_async(self, query: str) -> Dict[str, Any]:
@@ -273,38 +305,69 @@ class AgenticSearch:
             if not discovered_tools:
                 raise RuntimeError("No MCP tools were discovered.")
 
-            collected_documents: list[DocumentResult] = []
-            agent_tools = self._build_discovered_function_tools(
+            discovered_tool_names = [
+                tool.name for tool in discovered_tools if getattr(tool, "name", None)
+            ]
+            allowlisted_tools = self._allowlist_discovered_tools(discovered_tools)
+            allowlisted_tool_names = [
+                tool.name for tool in allowlisted_tools if getattr(tool, "name", None)
+            ]
+
+            if SHARED_SEARCH_TOOL not in allowlisted_tool_names:
+                return self._required_search_tool_missing_response(
+                    query,
+                    discovered_tool_names,
+                    allowlisted_tool_names,
+                )
+
+            outcome = await self._run_tool_calling_agent(
+                query,
                 server,
-                discovered_tools,
-                collected_documents,
+                allowlisted_tools,
+                allowlisted_tool_names,
             )
 
-            self._set_last_step("agent_run")
-            synthesized = await self._run_tool_calling_agent(
-                query,
-                agent_tools,
-                [tool.name for tool in discovered_tools if getattr(tool, "name", None)],
-                collected_documents,
+            citations = self._normalize_citations(
+                outcome.synthesized.citations,
+                outcome.collected_documents,
             )
-            citations = self._normalize_citations(synthesized.citations, collected_documents)
 
             if not citations:
-                citations = self._fallback_citations(collected_documents)
+                citations = self._fallback_citations(outcome.collected_documents)
 
             raw_response = {
                 "status": "ok",
                 "strategy": "agentic_discovery",
                 "model": self.model,
                 "query": query,
-                "discovered_tools": [tool.name for tool in discovered_tools if getattr(tool, "name", None)],
-                "selected_tools": sorted({document.source for document in collected_documents}),
+                "discovered_tools": discovered_tool_names,
+                "allowlisted_tools": allowlisted_tool_names,
+                "selected_tools": sorted(
+                    {document.source for document in outcome.collected_documents}
+                ),
+                "agent_run_used": outcome.run_used,
             }
             return {
-                "answer": synthesized.answer.strip(),
+                "answer": outcome.synthesized.answer.strip(),
                 "citations": [citation.model_dump() for citation in citations],
                 "raw_response": self._with_debug(raw_response),
             }
+
+    def _allowlist_discovered_tools(self, discovered_tools: Sequence[Any]) -> list[Any]:
+        allowlisted_tools = [
+            tool
+            for tool in discovered_tools
+            if getattr(tool, "name", None) in ALLOWED_AGENT_TOOL_NAMES
+        ]
+        self._record_debug(
+            "tool_allowlist",
+            {
+                "tool_names": [
+                    tool.name for tool in allowlisted_tools if getattr(tool, "name", None)
+                ]
+            },
+        )
+        return allowlisted_tools
 
     async def _list_tools(self, server: Any) -> list[Any]:
         self._set_last_step("list_tools")
@@ -326,9 +389,15 @@ class AgenticSearch:
         server: Any,
         discovered_tools: Sequence[Any],
         collected_documents: list[DocumentResult],
+        tool_invocations: list[str],
     ) -> list[FunctionTool]:
         return [
-            self._build_discovered_function_tool(server, tool, collected_documents)
+            self._build_discovered_function_tool(
+                server,
+                tool,
+                collected_documents,
+                tool_invocations,
+            )
             for tool in discovered_tools
             if getattr(tool, "name", None)
         ]
@@ -338,6 +407,7 @@ class AgenticSearch:
         server: Any,
         tool: Any,
         collected_documents: list[DocumentResult],
+        tool_invocations: list[str],
     ) -> FunctionTool:
         tool_name = tool.name
         description = getattr(tool, "description", None) or f"MCP tool '{tool_name}'."
@@ -351,6 +421,7 @@ class AgenticSearch:
                 tool,
                 self._parse_tool_input(input_json),
             )
+            tool_invocations.append(tool_name)
             payload = await self._call_tool(server, tool_name, arguments)
             documents = self._normalize_documents(payload, source=tool_name)
             collected_documents.extend(documents)
@@ -583,20 +654,84 @@ class AgenticSearch:
     async def _run_tool_calling_agent(
         self,
         query: str,
-        tools: Sequence[FunctionTool],
+        server: Any,
+        discovered_tools: Sequence[Any],
         discovered_tool_names: Sequence[str],
-        collected_documents: Sequence[DocumentResult],
-    ) -> SynthesizedAnswer:
-        try:
-            return await self._run_tool_calling_agent_structured(query, tools, discovered_tool_names)
-        except Exception:
-            if not self.uses_local_llm:
-                raise
-            return await self._run_tool_calling_agent_plain_text(
+    ) -> AgentRunOutcome:
+        attempts: list[dict[str, Any]] = []
+
+        for run_number in range(1, MAX_AGENT_RUN_ATTEMPTS + 1):
+            collected_documents: list[DocumentResult] = []
+            tool_invocations: list[str] = []
+            tools = self._build_discovered_function_tools(
+                server,
+                discovered_tools,
+                collected_documents,
+                tool_invocations,
+            )
+            synthesized, used_plain_text_fallback = await self._run_tool_calling_agent_once(
                 query,
                 tools,
                 discovered_tool_names,
                 collected_documents,
+                run_number,
+            )
+            attempt_summary = {
+                "run": run_number,
+                "tool_invocation_count": len(tool_invocations),
+                "tool_invocations": list(tool_invocations),
+                "search_call_count": tool_invocations.count(SHARED_SEARCH_TOOL),
+                "used_plain_text_fallback": used_plain_text_fallback,
+            }
+            attempts.append(attempt_summary)
+            if attempt_summary["search_call_count"] > 0:
+                self._record_debug(
+                    "tool_enforcement",
+                    {"runs": attempts, "run_used": run_number},
+                )
+                return AgentRunOutcome(
+                    synthesized=synthesized,
+                    collected_documents=collected_documents,
+                    run_used=run_number,
+                )
+
+        self._record_debug(
+            "tool_enforcement",
+            {"runs": attempts, "run_used": None},
+        )
+        return self._required_search_tool_not_called_error(query, attempts)
+
+    async def _run_tool_calling_agent_once(
+        self,
+        query: str,
+        tools: Sequence[FunctionTool],
+        discovered_tool_names: Sequence[str],
+        collected_documents: Sequence[DocumentResult],
+        run_number: int,
+    ) -> tuple[SynthesizedAnswer, bool]:
+        self._set_last_step(f"agent_run:{run_number}")
+        try:
+            return (
+                await self._run_tool_calling_agent_structured(
+                    query,
+                    tools,
+                    discovered_tool_names,
+                    run_number,
+                ),
+                False,
+            )
+        except Exception:
+            if not self.uses_local_llm:
+                raise
+            return (
+                await self._run_tool_calling_agent_plain_text(
+                    query,
+                    tools,
+                    discovered_tool_names,
+                    collected_documents,
+                    run_number,
+                ),
+                True,
             )
 
     async def _run_tool_calling_agent_structured(
@@ -604,10 +739,14 @@ class AgenticSearch:
         query: str,
         tools: Sequence[FunctionTool],
         discovered_tool_names: Sequence[str],
+        run_number: int,
     ) -> SynthesizedAnswer:
         agent = Agent(
             name="AgenticSearch",
-            instructions=self.build_agent_instructions(discovered_tool_names),
+            instructions=self.build_agent_instructions(
+                discovered_tool_names,
+                run_number=run_number,
+            ),
             model=self.model,
             tools=list(tools),
             output_type=SynthesizedAnswer,
@@ -621,11 +760,15 @@ class AgenticSearch:
         tools: Sequence[FunctionTool],
         discovered_tool_names: Sequence[str],
         collected_documents: Sequence[DocumentResult],
+        run_number: int,
     ) -> SynthesizedAnswer:
         agent = Agent(
             name="AgenticSearch",
             instructions=(
-                self.build_agent_instructions(discovered_tool_names)
+                self.build_agent_instructions(
+                    discovered_tool_names,
+                    run_number=run_number,
+                )
                 + " Return a concise plain-text answer only. Do not emit JSON or XML."
             ),
             model=self.model,
@@ -1659,9 +1802,69 @@ class AgenticSearch:
             "raw_response": self._with_debug(raw_response, exc),
         }
 
+    def _required_search_tool_missing_response(
+        self,
+        query: str,
+        discovered_tool_names: Sequence[str],
+        allowlisted_tool_names: Sequence[str],
+    ) -> Dict[str, Any]:
+        raw_response = {
+            "status": "required_search_tool_missing",
+            "query": query,
+            "model": self.model,
+            "required_tool": SHARED_SEARCH_TOOL,
+            "discovered_tools": list(discovered_tool_names),
+            "allowlisted_tools": list(allowlisted_tool_names),
+        }
+        return {
+            "answer": REQUIRED_SEARCH_TOOL_MISSING_MESSAGE,
+            "citations": [],
+            "raw_response": self._with_debug(raw_response),
+        }
+
+    def _required_search_tool_not_called_error(
+        self,
+        query: str,
+        attempts: Sequence[Mapping[str, Any]],
+    ) -> AgentRunOutcome:
+        raise RuntimeError(
+            json.dumps(
+                {
+                    "status": "required_search_tool_not_called",
+                    "query": query,
+                    "attempts": list(attempts),
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    def _required_search_tool_not_called_response(
+        self,
+        query: str,
+        attempts: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        raw_response = {
+            "status": "required_search_tool_not_called",
+            "query": query,
+            "model": self.model,
+            "required_tool": SHARED_SEARCH_TOOL,
+            "attempts": [dict(attempt) for attempt in attempts],
+        }
+        return {
+            "answer": REQUIRED_SEARCH_TOOL_NOT_CALLED_MESSAGE,
+            "citations": [],
+            "raw_response": self._with_debug(raw_response),
+        }
+
     def _error_response(
         self, query: str, status: str, exc: Exception
     ) -> Dict[str, Any]:
+        parsed_payload = self._parse_required_search_tool_error(exc)
+        if parsed_payload is not None:
+            return self._required_search_tool_not_called_response(
+                parsed_payload.get("query", query),
+                parsed_payload.get("attempts", []),
+            )
         raw_response = {
             "status": status,
             "query": query,
@@ -1676,3 +1879,17 @@ class AgenticSearch:
             "citations": [],
             "raw_response": self._with_debug(raw_response, exc),
         }
+
+    def _parse_required_search_tool_error(
+        self,
+        exc: Exception,
+    ) -> dict[str, Any] | None:
+        if not isinstance(exc, RuntimeError):
+            return None
+        try:
+            parsed = json.loads(str(exc))
+        except json.JSONDecodeError:
+            return None
+        if parsed.get("status") != "required_search_tool_not_called":
+            return None
+        return parsed

@@ -15,6 +15,8 @@ from agentic_search import (
     CONFLUENCE_AUTH_ISSUE_MESSAGE,
     DEFAULT_OLLAMA_CHAT_MODEL,
     PAYLOAD_PREVIEW_CHAR_LIMIT,
+    REQUIRED_SEARCH_TOOL_MISSING_MESSAGE,
+    REQUIRED_SEARCH_TOOL_NOT_CALLED_MESSAGE,
     SHARED_FETCH_TOOL,
     SHARED_SEARCH_TOOL,
     SynthesizedAnswer,
@@ -147,7 +149,7 @@ def test_build_discovered_function_tool_sanitizes_schema_before_function_tool_cr
         return SimpleNamespace(**kwargs)
 
     with patch("agentic_search.FunctionTool", side_effect=fake_function_tool):
-        function_tool = search._build_discovered_function_tool(FakeServer(), tool, [])
+        function_tool = search._build_discovered_function_tool(FakeServer(), tool, [], [])
 
     assert function_tool.name == SHARED_SEARCH_TOOL
     assert captured["params_json_schema"] == {
@@ -370,6 +372,8 @@ def test_default_mode_lists_tools_and_uses_agent_tool_wrapper(rovo_search_struct
     ]
     assert result["raw_response"]["status"] == "ok"
     assert result["raw_response"]["strategy"] == "agentic_discovery"
+    assert result["raw_response"]["allowlisted_tools"] == [SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL]
+    assert result["raw_response"]["agent_run_used"] == 1
     assert server.list_tools_calls == 1
     assert server.calls == [
         (
@@ -389,6 +393,156 @@ def test_default_mode_lists_tools_and_uses_agent_tool_wrapper(rovo_search_struct
     ]
     assert result["raw_response"]["selected_tools"] == [SHARED_FETCH_TOOL, SHARED_SEARCH_TOOL]
     run_agent.assert_awaited_once()
+
+
+def test_allowlist_excludes_non_search_and_fetch_tools(rovo_search_structured_results_payload):
+    server = FakeServer(
+        tools=[
+            *make_discovered_tools(),
+            make_tool("createConfluencePage", {"title": {"type": "string"}}, required=["title"]),
+            make_tool("updateConfluencePage", {"id": {"type": "string"}}, required=["id"]),
+        ],
+        responses={SHARED_SEARCH_TOOL: rovo_search_structured_results_payload},
+    )
+    search = make_search()
+
+    async def fake_runner(agent, prompt, **_kwargs):
+        assert {tool.name for tool in agent.tools} == {SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL}
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        return FakeRunResult(
+            SynthesizedAnswer(
+                answer="Filtered to search/fetch only.",
+                citations=[Citation(title="Beam Benefits Overview", url="https://example.com/beam-overview")],
+            )
+        )
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
+        result = search.search("What is Beam Benefits?")
+
+    assert result["raw_response"]["status"] == "ok"
+    assert result["raw_response"]["discovered_tools"] == [
+        SHARED_SEARCH_TOOL,
+        SHARED_FETCH_TOOL,
+        "createConfluencePage",
+        "updateConfluencePage",
+    ]
+    assert result["raw_response"]["allowlisted_tools"] == [SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL]
+
+
+def test_search_retries_when_first_run_skips_tools_then_succeeds(rovo_search_structured_results_payload):
+    server = FakeServer(
+        tools=make_discovered_tools(),
+        responses={SHARED_SEARCH_TOOL: rovo_search_structured_results_payload},
+    )
+    search = make_search()
+    attempts = {"count": 0}
+
+    async def fake_runner(agent, prompt, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return FakeRunResult(SynthesizedAnswer(answer="Skipped tools.", citations=[]))
+        await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
+        return FakeRunResult(
+            SynthesizedAnswer(
+                answer="Used search on retry.",
+                citations=[Citation(title="Beam Benefits Overview", url="https://example.com/beam-overview")],
+            )
+        )
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)) as run_agent,
+    ):
+        result = search.search("What is Beam Benefits?")
+
+    assert result["answer"] == "Used search on retry."
+    assert result["raw_response"]["status"] == "ok"
+    assert result["raw_response"]["agent_run_used"] == 2
+    assert server.calls == [
+        (
+            SHARED_SEARCH_TOOL,
+            {"query": "What is Beam Benefits?", "cloudId": "test-cloud-id"},
+        )
+    ]
+    assert run_agent.await_count == 2
+
+
+def test_search_returns_clear_error_after_two_runs_without_tool_calls(monkeypatch):
+    monkeypatch.setenv("AGENTIC_SEARCH_DEBUG", "1")
+    server = FakeServer(tools=make_discovered_tools(), responses={})
+    search = make_search()
+
+    async def fake_runner(_agent, _prompt, **_kwargs):
+        return FakeRunResult(SynthesizedAnswer(answer="No tools used.", citations=[]))
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)) as run_agent,
+    ):
+        result = search.search("What is Beam Benefits?")
+
+    assert result["answer"] == REQUIRED_SEARCH_TOOL_NOT_CALLED_MESSAGE
+    assert result["citations"] == []
+    assert result["raw_response"]["status"] == "required_search_tool_not_called"
+    assert result["raw_response"]["attempts"] == [
+        {
+            "run": 1,
+            "tool_invocation_count": 0,
+            "tool_invocations": [],
+            "search_call_count": 0,
+            "used_plain_text_fallback": False,
+        },
+        {
+            "run": 2,
+            "tool_invocation_count": 0,
+            "tool_invocations": [],
+            "search_call_count": 0,
+            "used_plain_text_fallback": False,
+        },
+    ]
+    assert result["raw_response"]["debug"]["tool_enforcement"] == {
+        "runs": result["raw_response"]["attempts"],
+        "run_used": None,
+    }
+    assert server.calls == []
+    assert run_agent.await_count == 2
+
+
+def test_search_fails_fast_when_required_search_tool_is_not_discovered():
+    server = FakeServer(
+        tools=[
+            make_tool(
+                SHARED_FETCH_TOOL,
+                {"ari": {"type": "string"}, "cloudId": {"type": "string"}},
+                required=["ari"],
+            ),
+            make_tool("createConfluencePage", {"title": {"type": "string"}}, required=["title"]),
+        ],
+        responses={},
+    )
+    search = make_search()
+
+    with (
+        patch("agentic_search.MCPServerStreamableHttp", return_value=server),
+        patch("agentic_search.Runner.run", new=AsyncMock()) as run_agent,
+    ):
+        result = search.search("What is Beam Benefits?")
+
+    assert result["answer"] == REQUIRED_SEARCH_TOOL_MISSING_MESSAGE
+    assert result["citations"] == []
+    assert result["raw_response"] == {
+        "status": "required_search_tool_missing",
+        "query": "What is Beam Benefits?",
+        "model": "gpt-4.1-mini",
+        "required_tool": SHARED_SEARCH_TOOL,
+        "discovered_tools": [SHARED_FETCH_TOOL, "createConfluencePage"],
+        "allowlisted_tools": [SHARED_FETCH_TOOL],
+    }
+    assert server.calls == []
+    run_agent.assert_not_awaited()
 
 
 def test_default_mode_maps_list_tools_failure_to_confluence_auth_issue(monkeypatch, capsys):
