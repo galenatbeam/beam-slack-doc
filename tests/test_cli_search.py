@@ -11,6 +11,7 @@ def test_main_prints_answer_and_citations(monkeypatch, capsys):
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = "test-openai-key"
+            self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
             self.atlassian_cloud_id = "test-cloud-id"
 
@@ -49,6 +50,7 @@ def test_main_prints_json_when_requested(monkeypatch, capsys):
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = "test-openai-key"
+            self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
             self.atlassian_cloud_id = "test-cloud-id"
 
@@ -70,6 +72,7 @@ def test_main_returns_error_for_missing_required_config(monkeypatch, capsys):
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = ""
+            self.atlassian_email = ""
             self.confluence_mcp_api_key = ""
             self.atlassian_cloud_id = ""
 
@@ -84,6 +87,7 @@ def test_main_returns_error_for_missing_required_config(monkeypatch, capsys):
 
     assert exit_code == 1
     assert "OPENAI_API_KEY" in captured.err
+    assert "ATLASSIAN_EMAIL" in captured.err
     assert "CONFLUENCE_MCP_API_KEY" in captured.err
     assert "ATLASSIAN_CLOUD_ID" in captured.err
 
@@ -92,6 +96,7 @@ def test_main_allows_local_mode_without_real_openai_api_key(monkeypatch, capsys)
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = "ollama"
+            self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
             self.atlassian_cloud_id = "test-cloud-id"
 
@@ -118,6 +123,7 @@ def test_main_prints_debug_failure_summary_to_stderr_without_json(monkeypatch, c
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = "test-openai-key"
+            self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
             self.atlassian_cloud_id = "test-cloud-id"
 
@@ -154,6 +160,7 @@ def test_main_prints_ari_when_citation_has_no_url(monkeypatch, capsys):
     class FakeSearch:
         def __init__(self):
             self.openai_api_key = "test-openai-key"
+            self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
             self.atlassian_cloud_id = "test-cloud-id"
 
@@ -196,5 +203,6 @@ def test_help_mentions_agentic_search_debug(capsys):
 
     assert excinfo.value.code == 0
     assert "AGENTIC_SEARCH_DEBUG" in captured.out
+    assert "ATLASSIAN_EMAIL" in captured.out
     assert "CONFLUENCE_MCP_API_KEY" in captured.out
     assert "ATLASSIAN_CLOUD_ID" in captured.out

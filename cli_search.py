@@ -16,7 +16,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Search documentation with AgenticSearch.",
         epilog=(
-            "Required MCP config: CONFLUENCE_MCP_API_KEY and ATLASSIAN_CLOUD_ID. "
+            "Required MCP config: ATLASSIAN_EMAIL, CONFLUENCE_MCP_API_KEY, and "
+            "ATLASSIAN_CLOUD_ID. Atlassian MCP auth uses Basic "
+            "base64(ATLASSIAN_EMAIL:CONFLUENCE_MCP_API_KEY). "
             "MCP_SERVER_URL is optional and defaults to https://mcp.atlassian.com/v1/mcp. "
             "Search also requires either "
             "OPENAI_API_KEY (OpenAI-hosted mode) or LLM_BASE_URL=http://localhost:11434/v1 "
@@ -24,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
             "OPENAI_MODEL, CONFLUENCE_SPACE, MCP_SERVER_URL, MCP_SERVER_NAME. Set "
             "AGENTIC_SEARCH_DEBUG=1 (also true/yes) to emit MCP debug summaries "
             "to stderr and include raw_response.debug in --json output without printing "
-            "auth headers or API keys."
+            "auth headers, raw Atlassian credentials, or encoded Basic credentials."
         ),
     )
     parser.add_argument("query", help="Question or keywords to search for")
@@ -44,6 +46,8 @@ def _missing_config(search: AgenticSearch) -> list[str]:
     missing: list[str] = []
     if not getattr(search, "openai_api_key", ""):
         missing.append("OPENAI_API_KEY")
+    if not getattr(search, "atlassian_email", ""):
+        missing.append("ATLASSIAN_EMAIL")
     if not getattr(search, "confluence_mcp_api_key", ""):
         missing.append("CONFLUENCE_MCP_API_KEY")
     if not getattr(search, "atlassian_cloud_id", ""):

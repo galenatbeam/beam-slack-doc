@@ -22,6 +22,7 @@ pip install -r requirements.txt
 export SLACK_SIGNING_SECRET="your-signing-secret"
 export SLACK_BOT_TOKEN="xoxb-your-bot-token"
 export OPENAI_API_KEY="your-openai-key"
+export ATLASSIAN_EMAIL="you@example.com"
 export CONFLUENCE_MCP_API_KEY="your-confluence-mcp-api-key"
 export ATLASSIAN_CLOUD_ID="your-atlassian-cloud-id"
 export CONFLUENCE_SPACE="YOURSPACE"
@@ -32,13 +33,14 @@ python slack_bot.py
 The app will start on `http://localhost:3000` by default.
 
 You can also put these values in a `.env` file; both `slack_bot.py` and `cli_search.py`
-load it automatically.
+load it automatically. See `.env.example` for a ready-to-copy template.
 
 ## CLI usage
 
 Required environment variables:
 
-- `CONFLUENCE_MCP_API_KEY` — sent as `Authorization: Bearer <CONFLUENCE_MCP_API_KEY>`
+- `ATLASSIAN_EMAIL` — Atlassian account email used for MCP Basic auth
+- `CONFLUENCE_MCP_API_KEY` — Atlassian personal API token used with `ATLASSIAN_EMAIL`
 - `ATLASSIAN_CLOUD_ID` — pins the Atlassian tenant/site when the shared Rovo `search` tool accepts `cloudId`
 
 Default agentic mode also requires:
@@ -58,10 +60,15 @@ Optional environment variables:
 This repo now uses a single MCP auth shape for bot/CI/non-interactive use cases.
 
 ```bash
+export ATLASSIAN_EMAIL="you@example.com"
 export CONFLUENCE_MCP_API_KEY="your-confluence-mcp-api-key"
 export ATLASSIAN_CLOUD_ID="your-atlassian-cloud-id"
 export MCP_SERVER_URL="https://mcp.atlassian.com/v1/mcp"  # optional override
 ```
+
+The MCP server receives:
+
+`Authorization: Basic <base64(ATLASSIAN_EMAIL:CONFLUENCE_MCP_API_KEY)>`
 
 ### Local LLM mode (Ollama)
 
@@ -69,6 +76,7 @@ To run the CLI against a local OpenAI-compatible Ollama endpoint, set:
 
 ```bash
 export LLM_BASE_URL="http://localhost:11434/v1"
+export ATLASSIAN_EMAIL="you@example.com"
 export CONFLUENCE_MCP_API_KEY="your-confluence-mcp-api-key"
 export ATLASSIAN_CLOUD_ID="your-atlassian-cloud-id"
 ```
@@ -104,8 +112,8 @@ AGENTIC_SEARCH_DEBUG=1 python cli_search.py --json "What is Beam Benefits?"
 When enabled, AgenticSearch writes an MCP debug summary to stderr and adds
 `raw_response.debug` to the JSON response. The debug payload includes discovered
 tool names from `list_tools()`, called tool names, call argument keys, and
-response summaries. Auth headers,
-API keys, and content body previews are not logged.
+response summaries. Auth headers, raw Atlassian email/token values, encoded
+Basic credentials, and content body previews are not logged.
 
 ## Slack endpoints
 
