@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,7 @@ load_dotenv()
 
 PLACEHOLDER_TEXT = "Searching docs..."
 EVENT_ID_TTL_SECONDS = 600
+QUESTION_REGEX = re.compile(r"\?")
 
 
 class RecentEventCache:
@@ -89,6 +91,10 @@ class SlackHttpBot:
         def handle_app_mention(event, body, client) -> None:  # type: ignore[no-untyped-def]
             self.handle_app_mention_event(event=event, body=body, client=client)
 
+        @self.bolt_app.event("message")
+        def handle_message(event, body, client) -> None:  # type: ignore[no-untyped-def]
+            self.handle_message_event(event=event, body=body, client=client)
+
     def handle_app_mention_event(self, event: Dict[str, object], body: Dict[str, object], client: Any) -> None:
         if self.should_ignore_app_mention(event, body):
             return
@@ -106,6 +112,43 @@ class SlackHttpBot:
             return
 
         prompt = self.extract_prompt({"event": event})
+        placeholder = client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=PLACEHOLDER_TEXT,
+        )
+        placeholder_ts = str(placeholder.get("ts") or "").strip()
+        if not placeholder_ts:
+            return
+
+        self.executor.submit(
+            self.complete_app_mention,
+            client,
+            channel,
+            placeholder_ts,
+            prompt,
+        )
+
+    def handle_message_event(self, event: Dict[str, object], body: Dict[str, object], client: Any) -> None:
+        if self.should_ignore_message_event(event, body):
+            return
+
+        channel = str(event.get("channel") or "").strip()
+        if not self.is_channel_message(event, channel):
+            return
+
+        thread_ts = self.resolve_thread_ts(event)
+        if not thread_ts:
+            return
+
+        prompt = self.extract_prompt({"event": event})
+        if not QUESTION_REGEX.search(prompt):
+            return
+
+        event_id = str(body.get("event_id") or "").strip()
+        if event_id and not self.event_cache.add(event_id):
+            return
+
         placeholder = client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
@@ -209,13 +252,45 @@ class SlackHttpBot:
         return str(value or "").strip()
 
     @staticmethod
-    def should_ignore_app_mention(event: Dict[str, object], body: Dict[str, object]) -> bool:
-        if event.get("subtype") == "bot_message" or event.get("bot_id"):
+    def is_channel_message(event: Dict[str, object], channel: str | None = None) -> bool:
+        channel_type = str(event.get("channel_type") or "").strip()
+        resolved_channel = channel if channel is not None else str(event.get("channel") or "").strip()
+        return channel_type == "channel" or resolved_channel.startswith("C")
+
+    @staticmethod
+    def should_ignore_slack_event(event: Dict[str, object], body: Dict[str, object]) -> bool:
+        if event.get("bot_id"):
             return True
 
         authorized_user_id = SlackHttpBot.extract_authorized_user_id(body)
         event_user_id = str(event.get("user") or "").strip()
         return bool(authorized_user_id and event_user_id == authorized_user_id)
+
+    @staticmethod
+    def should_ignore_app_mention(event: Dict[str, object], body: Dict[str, object]) -> bool:
+        if event.get("subtype") == "bot_message":
+            return True
+
+        return SlackHttpBot.should_ignore_slack_event(event, body)
+
+    @staticmethod
+    def should_ignore_message_event(event: Dict[str, object], body: Dict[str, object]) -> bool:
+        if event.get("subtype"):
+            return True
+
+        if SlackHttpBot.should_ignore_slack_event(event, body):
+            return True
+
+        text = SlackHttpBot.extract_prompt({"event": event})
+        bot_user_id = SlackHttpBot.extract_authorized_user_id(body)
+        return SlackHttpBot.contains_direct_bot_mention(text, bot_user_id)
+
+    @staticmethod
+    def contains_direct_bot_mention(text: str, bot_user_id: str) -> bool:
+        if not text or not bot_user_id:
+            return False
+
+        return f"<@{bot_user_id}>" in text
 
     @staticmethod
     def extract_authorized_user_id(body: Dict[str, object]) -> str:
