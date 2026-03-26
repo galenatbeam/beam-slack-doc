@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
+from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from agentic_search import AgenticSearch
 
@@ -54,6 +55,7 @@ class SlackHttpBot:
         self,
         signing_secret: str | None = None,
         bot_token: str | None = None,
+        app_token: str | None = None,
         agentic_search: AgenticSearch | None = None,
         executor: ThreadPoolExecutor | None = None,
         event_cache: RecentEventCache | None = None,
@@ -61,6 +63,7 @@ class SlackHttpBot:
     ) -> None:
         self.signing_secret = signing_secret or os.getenv("SLACK_SIGNING_SECRET", "")
         self.bot_token = bot_token or os.getenv("SLACK_BOT_TOKEN", "")
+        self.app_token = os.getenv("SLACK_APP_TOKEN", "") if app_token is None else app_token
         self.agentic_search = agentic_search or AgenticSearch(
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             confluence_space=os.getenv("CONFLUENCE_SPACE", ""),
@@ -146,6 +149,20 @@ class SlackHttpBot:
 
         return app
 
+    def should_use_socket_mode(self) -> bool:
+        return self.app_token.startswith("xapp-")
+
+    def create_socket_mode_handler(self) -> SocketModeHandler:
+        return SocketModeHandler(self.bolt_app, self.app_token)
+
+    def run(self, app: Flask | None = None, port: int | None = None, debug: bool = True) -> None:
+        if self.should_use_socket_mode():
+            self.create_socket_mode_handler().start()
+            return
+
+        flask_app = app or self.create_app()
+        flask_app.run(host="0.0.0.0", port=port or int(os.getenv("PORT", "3000")), debug=debug)
+
     def build_slack_message(self, prompt: str) -> Dict[str, str]:
         return {"response_type": "ephemeral", "text": self.build_response_text(prompt)}
 
@@ -224,9 +241,14 @@ class SlackHttpBot:
         return ""
 
 
-app = SlackHttpBot().create_app()
+bot = SlackHttpBot()
+app = bot.create_app()
+
+
+def main() -> None:
+    port = int(os.getenv("PORT", "3000"))
+    bot.run(app=app, port=port, debug=True)
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "3000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    main()
