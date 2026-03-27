@@ -168,6 +168,32 @@ def test_handle_message_event_posts_placeholder_then_updates_it_in_thread():
     ]
 
 
+def test_handle_message_event_ignores_thread_replies():
+    bot, fake_search, executor = make_bot()
+    client = FakeSlackClient()
+
+    bot.handle_message_event(
+        event={
+            "channel": "C123",
+            "channel_type": "channel",
+            "thread_ts": "171.000",
+            "ts": "171.001",
+            "text": "What is Beam?",
+            "user": "U123",
+        },
+        body={
+            "event_id": "evt-message-thread-reply",
+            "authorizations": [{"user_id": "B123"}],
+        },
+        client=client,
+    )
+
+    assert executor.submissions == []
+    assert client.post_calls == []
+    assert client.update_calls == []
+    assert fake_search.queries == []
+
+
 def test_handle_message_event_ignores_messages_without_question_mark():
     bot, fake_search, executor = make_bot()
     client = FakeSlackClient()
