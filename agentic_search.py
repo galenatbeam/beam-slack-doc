@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from contextlib import AsyncExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from typing import Any, Dict, Mapping, Sequence
 
 from agents import (
@@ -21,9 +21,34 @@ from agents import (
 )
 from agents.mcp import MCPServerStreamableHttp
 from agents.tool import FunctionTool
+from document_normalization import (
+    extract_payload,
+    extract_text_blob,
+    fallback_citations,
+    first_string,
+    iter_candidate_dicts,
+    iter_nested_dicts,
+    merge_document,
+    maybe_parse_json,
+    normalize_citations,
+    normalize_documents,
+)
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from pydantic import BaseModel, Field
+from search_models import (
+    AgentRunOutcome,
+    Citation,
+    DiscoveredToolBinding,
+    DocumentResult,
+    MCPServerBinding,
+    SynthesizedAnswer,
+    ToolStrategy,
+)
+from tool_argument_policy import (
+    normalize_github_org,
+    prepare_atlassian_tool_arguments,
+    prepare_github_tool_arguments,
+)
 
 load_dotenv()
 
@@ -55,12 +80,6 @@ REQUIRED_SEARCH_TOOL_NOT_CALLED_MESSAGE = (
     "Please try again. If this keeps happening, enable AGENTIC_SEARCH_DEBUG=1 "
     "to inspect tool-calling behavior."
 )
-TITLE_KEYS = ("title", "name", "pageTitle")
-URL_KEYS = ("url", "webLink", "link", "pageUrl")
-EXCERPT_KEYS = ("excerpt", "snippet", "summary", "text")
-ID_KEYS = ("id", "pageId", "contentId", "entityId")
-ARI_KEYS = ("ari", "resourceAri", "resourceARI", "resourceId")
-CONTENT_KEYS = ("body", "content", "markdown", "value")
 CONFLUENCE_MCP_API_KEY_ENV = "CONFLUENCE_MCP_API_KEY"
 ATLASSIAN_EMAIL_ENV = "ATLASSIAN_EMAIL"
 ATLASSIAN_CLOUD_ID_ENV = "ATLASSIAN_CLOUD_ID"
@@ -128,78 +147,6 @@ def _normalize_debug_key(key: str) -> str:
 
 def _is_sensitive_debug_key(key: str) -> bool:
     return _normalize_debug_key(key) in SENSITIVE_DEBUG_KEYS
-
-
-class Citation(BaseModel):
-    """Citation returned to callers."""
-
-    title: str
-    url: str | None = None
-    excerpt: str | None = None
-    identifier: str | None = None
-    ari: str | None = None
-
-
-class SynthesizedAnswer(BaseModel):
-    """Structured model output for final answers."""
-
-    answer: str
-    citations: list[Citation] = Field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class ToolStrategy:
-    """Selected MCP tool strategy."""
-
-    name: str
-    search_tool: str
-    fetch_tool: str | None
-    uses_cql: bool
-
-
-@dataclass
-class DocumentResult:
-    """Normalized documentation result used for synthesis and citations."""
-
-    title: str
-    url: str | None = None
-    excerpt: str | None = None
-    identifier: str | None = None
-    ari: str | None = None
-    content: str | None = None
-    source: str = "search"
-
-
-@dataclass
-class AgentRunOutcome:
-    """Successful agent run outcome after search-tool enforcement."""
-
-    synthesized: SynthesizedAnswer
-    collected_documents: list[DocumentResult]
-    run_used: int
-
-
-@dataclass(frozen=True)
-class MCPServerBinding:
-    """Connected MCP server metadata used for tool routing."""
-
-    key: str
-    name: str
-    url: str
-    server: Any
-
-
-@dataclass(frozen=True)
-class DiscoveredToolBinding:
-    """Discovered tool plus the originating server it must be called on."""
-
-    server_binding: MCPServerBinding
-    tool: Any
-    public_name: str
-
-    @property
-    def original_name(self) -> str:
-        return str(getattr(self.tool, "name", self.public_name))
 
 
 class AgenticSearch:
@@ -846,13 +793,14 @@ class AgenticSearch:
         server_key: str = ATLASSIAN_SERVER_KEY,
     ) -> dict[str, Any]:
         prepared = dict(arguments)
-        if server_key == ATLASSIAN_SERVER_KEY and self.atlassian_cloud_id and self._tool_accepts_param(tool, "cloudId"):
-            provided_cloud_id = prepared.get("cloudId")
-            if (
-                "cloudId" in prepared
-                and isinstance(provided_cloud_id, str)
-                and provided_cloud_id != self.atlassian_cloud_id
-            ):
+        if server_key == ATLASSIAN_SERVER_KEY:
+            prepared, override_detected = prepare_atlassian_tool_arguments(
+                tool,
+                prepared,
+                self.atlassian_cloud_id,
+                tool_accepts_param=self._tool_accepts_param,
+            )
+            if override_detected:
                 self._record_debug_warning(
                     {
                         "warning_type": "cloud_id_override",
@@ -861,7 +809,6 @@ class AgenticSearch:
                         "configured_cloud_id": "[REDACTED]",
                     }
                 )
-            prepared["cloudId"] = self.atlassian_cloud_id
         if server_key == GITHUB_SERVER_KEY:
             prepared = self._prepare_github_tool_arguments(tool, prepared)
         return prepared
@@ -871,58 +818,25 @@ class AgenticSearch:
         tool: Any,
         arguments: Mapping[str, Any],
     ) -> dict[str, Any]:
-        prepared = dict(arguments)
-        if not self.github_org:
-            return prepared
-
-        github_scope_keys = [
-            key for key in ("owner", "org", "organization") if self._tool_accepts_param(tool, key)
-        ]
-        override_recorded = False
-        for key in github_scope_keys:
-            provided_value = prepared.get(key)
-            normalized_value = self._normalize_github_org(
-                provided_value if isinstance(provided_value, str) else ""
+        prepared, override_detected = prepare_github_tool_arguments(
+            tool,
+            arguments,
+            self.github_org,
+            tool_accepts_param=self._tool_accepts_param,
+        )
+        if override_detected:
+            self._record_debug_warning(
+                {
+                    "warning_type": "github_org_override",
+                    "tool_name": getattr(tool, "name", None),
+                    "provided_org": "[REDACTED]",
+                    "configured_org": "[REDACTED]",
+                }
             )
-            if (
-                not override_recorded
-                and key in prepared
-                and isinstance(provided_value, str)
-                and normalized_value
-                and normalized_value != self.github_org
-            ):
-                self._record_debug_warning(
-                    {
-                        "warning_type": "github_org_override",
-                        "tool_name": getattr(tool, "name", None),
-                        "provided_org": "[REDACTED]",
-                        "configured_org": "[REDACTED]",
-                    }
-                )
-                override_recorded = True
-            prepared[key] = self.github_org
         return prepared
 
     def _normalize_github_org(self, value: str | None) -> str:
-        candidate = (value or "").strip()
-        if not candidate:
-            return ""
-
-        candidate = re.sub(r"^https?://", "", candidate, flags=re.IGNORECASE)
-        candidate = candidate.removeprefix("git@github.com:")
-        candidate = candidate.removeprefix("@")
-        candidate = candidate.removeprefix("www.")
-        candidate = re.split(r"[?#]", candidate, maxsplit=1)[0].strip().strip("/")
-
-        if candidate.lower().startswith("github.com/"):
-            candidate = candidate[len("github.com/") :]
-
-        parts = [segment.strip() for segment in candidate.split("/") if segment.strip()]
-        if not parts:
-            return ""
-
-        normalized = parts[0].removesuffix(".git").strip()
-        return normalized.lower()
+        return normalize_github_org(value)
 
     async def _run_tool_calling_agent(
         self,
@@ -1436,94 +1350,17 @@ class AgenticSearch:
         return DEFAULT_MODEL
 
     def _normalize_documents(self, payload: Any, source: str) -> list[DocumentResult]:
-        extracted = self._extract_payload(payload)
-        candidates = list(self._iter_candidate_dicts(extracted))
-        if isinstance(extracted, dict) and not candidates:
-            candidates = [extracted]
-
-        documents: list[DocumentResult] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            identifier = self._first_string(candidate, ID_KEYS)
-            ari = self._first_string(candidate, ARI_KEYS)
-            title = (
-                self._first_string(candidate, TITLE_KEYS)
-                or identifier
-                or ari
-                or self._first_string(candidate, EXCERPT_KEYS)
-            )
-            url = self._first_string(candidate, URL_KEYS)
-            excerpt = self._first_string(candidate, EXCERPT_KEYS)
-            content = self._extract_text_blob(candidate)
-            if content == excerpt:
-                content = None
-
-            if not title:
-                continue
-
-            dedupe_key = url or ari or identifier or title
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            documents.append(
-                DocumentResult(
-                    title=title,
-                    url=url,
-                    excerpt=excerpt,
-                    identifier=identifier,
-                    ari=ari,
-                    content=content,
-                    source=source,
-                )
-            )
-
-        return documents[: self.max_results]
+        return normalize_documents(payload, source, max_results=self.max_results)
 
     def _normalize_citations(
         self,
         citations: Sequence[Citation],
         documents: Sequence[DocumentResult],
     ) -> list[Citation]:
-        by_title = {document.title: document for document in documents}
-        normalized: list[Citation] = []
-        seen: set[tuple[str, str]] = set()
-        for citation in citations:
-            document = by_title.get(citation.title)
-            url = citation.url or (document.url if document else None)
-            identifier = citation.identifier or (document.identifier if document else None)
-            ari = citation.ari or (document.ari if document else None)
-            reference = url or ari or identifier
-            if not citation.title or not reference:
-                continue
-            key = (citation.title, reference)
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append(
-                Citation(
-                    title=citation.title,
-                    url=url,
-                    excerpt=citation.excerpt or (document.excerpt if document else None),
-                    identifier=identifier,
-                    ari=ari,
-                )
-            )
-        return normalized
+        return normalize_citations(citations, documents)
 
     def _fallback_citations(self, documents: Sequence[DocumentResult]) -> list[Citation]:
-        citations: list[Citation] = []
-        for document in documents:
-            if document.url or document.ari or document.identifier:
-                citations.append(
-                    Citation(
-                        title=document.title,
-                        url=document.url,
-                        excerpt=document.excerpt,
-                        identifier=document.identifier,
-                        ari=document.ari,
-                    )
-                )
-        return citations[:MAX_FETCH_RESULTS]
+        return fallback_citations(documents, limit=MAX_FETCH_RESULTS)
 
     def _merge_document(
         self,
@@ -1531,71 +1368,19 @@ class AgenticSearch:
         fetched_documents: Sequence[DocumentResult],
         fallback_content: str | None,
     ) -> DocumentResult:
-        if not fetched_documents:
-            if fallback_content:
-                original.content = fallback_content
-            return original
-
-        fetched = fetched_documents[0]
-        return DocumentResult(
-            title=fetched.title or original.title,
-            url=fetched.url or original.url,
-            excerpt=fetched.excerpt or original.excerpt,
-            identifier=fetched.identifier or original.identifier,
-            ari=fetched.ari or original.ari,
-            content=fetched.content or fallback_content or original.content,
-            source=fetched.source,
-        )
+        return merge_document(original, fetched_documents, fallback_content)
 
     def _extract_payload(self, payload: Any) -> Any:
-        if hasattr(payload, "structuredContent") and payload.structuredContent is not None:
-            return payload.structuredContent
-
-        if hasattr(payload, "content"):
-            text_fragments: list[str] = []
-            for item in payload.content:
-                if getattr(item, "type", None) == "text":
-                    text_fragments.append(item.text)
-            if len(text_fragments) == 1:
-                return self._maybe_parse_json(text_fragments[0])
-            if text_fragments:
-                return [self._maybe_parse_json(fragment) for fragment in text_fragments]
-
-        return payload
+        return extract_payload(payload)
 
     def _iter_candidate_dicts(self, value: Any):
-        if isinstance(value, dict):
-            if any(key in value for key in TITLE_KEYS + URL_KEYS + ID_KEYS + ARI_KEYS):
-                yield value
-            for nested in value.values():
-                yield from self._iter_candidate_dicts(nested)
-        elif isinstance(value, list):
-            for item in value:
-                yield from self._iter_candidate_dicts(item)
+        yield from iter_candidate_dicts(value)
 
     def _iter_nested_dicts(self, value: Any):
-        if isinstance(value, dict):
-            yield value
-            for nested in value.values():
-                yield from self._iter_nested_dicts(nested)
-        elif isinstance(value, list):
-            for item in value:
-                yield from self._iter_nested_dicts(item)
+        yield from iter_nested_dicts(value)
 
     def _extract_text_blob(self, value: Any) -> str | None:
-        if isinstance(value, str):
-            return value.strip() or None
-        if isinstance(value, dict):
-            for key in CONTENT_KEYS:
-                nested = value.get(key)
-                text = self._extract_text_blob(nested)
-                if text:
-                    return text
-            return None
-        if isinstance(value, list):
-            parts = [part for item in value if (part := self._extract_text_blob(item))]
-            return "\n\n".join(parts) if parts else None
-        return None
+        return extract_text_blob(value)
 
     def _tool_accepts_param(self, tool: Any, key: str) -> bool:
         schema = getattr(tool, "inputSchema", {}) or {}
@@ -1611,22 +1396,10 @@ class AgenticSearch:
         return None
 
     def _first_string(self, mapping: Mapping[str, Any], keys: Sequence[str]) -> str | None:
-        for key in keys:
-            value = mapping.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return None
+        return first_string(mapping, keys)
 
     def _maybe_parse_json(self, text: str) -> Any:
-        stripped = text.strip()
-        if not stripped:
-            return stripped
-        if stripped[0] in "[{":
-            try:
-                return json.loads(stripped)
-            except json.JSONDecodeError:
-                return stripped
-        return stripped
+        return maybe_parse_json(text)
 
     def _build_cql_query(self, query: str) -> str:
         escaped_query = query.replace("\\", "\\\\").replace('"', '\\"')
