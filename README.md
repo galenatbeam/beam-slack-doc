@@ -21,6 +21,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 export SLACK_SIGNING_SECRET="your-signing-secret"
 export SLACK_BOT_TOKEN="xoxb-your-bot-token"
+export SLACK_APP_TOKEN="xapp-your-app-level-token"  # optional; enables Socket Mode
 export OPENAI_API_KEY="your-openai-key"
 export ATLASSIAN_EMAIL="you@example.com"
 export CONFLUENCE_MCP_API_KEY="your-confluence-mcp-api-key"
@@ -30,10 +31,54 @@ export MCP_SERVER_NAME="atlassian-rovo"
 python slack_bot.py
 ```
 
-The app will start on `http://localhost:3000` by default.
+The app will start on `http://localhost:3000` by default when `SLACK_APP_TOKEN` is unset.
 
 You can also put these values in a `.env` file; both `slack_bot.py` and `cli_search.py`
 load it automatically. See `.env.example` for a ready-to-copy template.
+
+## Slack bot run modes
+
+### Socket Mode (recommended for local MVP testing)
+
+Set `SLACK_APP_TOKEN` to run the existing Bolt app via Socket Mode instead of receiving events over HTTP.
+
+1. In your Slack app settings, enable **Socket Mode**.
+2. Create an **app-level token** with the `connections:write` scope. The token value starts with `xapp-`.
+3. Export `SLACK_APP_TOKEN` alongside your existing `SLACK_BOT_TOKEN` and search/MCP env vars.
+4. Run:
+
+```bash
+python slack_bot.py
+```
+
+Notes:
+
+- Socket Mode does **not** require ngrok for local mention testing.
+- The existing `app_mention` flow is unchanged: the bot posts a thread placeholder, runs search asynchronously, then updates that placeholder.
+
+## Slack app configuration
+
+Required bot token scopes:
+
+- `app_mentions:read`
+- `channels:history`
+- `chat:write`
+- `commands`
+
+Required event subscriptions:
+
+- `app_mention`
+- `message.channels`
+
+If you use Socket Mode locally, your app-level token also needs `connections:write`.
+
+### HTTP mode (fallback)
+
+If `SLACK_APP_TOKEN` is unset, `slack_bot.py` keeps the existing Flask HTTP mode:
+
+- `POST /slack/events`
+- `POST /slack/commands`
+- `GET /healthz`
 
 ## CLI usage
 
@@ -126,6 +171,7 @@ Basic credentials, and content body previews are not logged.
 - Uses `slack_bolt` with Flask adapter wiring
 - Responds to `/search-docs` slash commands with an `AgenticSearch` answer
 - Responds to `app_mention` events with the same `AgenticSearch` answer
+- Responds to `message.channels` events containing `?` with the same async placeholder → threaded reply flow
 - Lets Bolt handle Slack request verification and URL verification flows
 
 ## Next steps
