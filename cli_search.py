@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from dotenv import load_dotenv
@@ -23,7 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Search also requires either "
             "OPENAI_API_KEY (OpenAI-hosted mode) or LLM_BASE_URL=http://localhost:11434/v1 "
             "(local Ollama mode; OPENAI_API_KEY optional). Optional: "
-            "OPENAI_MODEL, CONFLUENCE_SPACE, MCP_SERVER_URL, MCP_SERVER_NAME. Set "
+            "OPENAI_MODEL, CONFLUENCE_SPACE, MCP_SERVER_URL, MCP_SERVER_NAME, "
+            "GITHUB_PAT, GITHUB_ORG, GITHUB_MCP_SERVER_URL, GITHUB_MCP_SERVER_NAME. "
+            "When GitHub is enabled, AgenticSearch searches Atlassian first and only uses "
+            "the GitHub readonly MCP server as a fallback for README/code context. Set "
             "AGENTIC_SEARCH_DEBUG=1 (also true/yes) to emit MCP debug summaries "
             "to stderr and include raw_response.debug in --json output without printing "
             "auth headers, raw Atlassian credentials, or encoded Basic credentials."
@@ -101,7 +105,12 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
 
-    search = AgenticSearch()
+    search = AgenticSearch(
+        github_pat=os.getenv("GITHUB_PAT"),
+        github_org=os.getenv("GITHUB_ORG"),
+        github_mcp_server_url=os.getenv("GITHUB_MCP_SERVER_URL"),
+        github_mcp_server_name=os.getenv("GITHUB_MCP_SERVER_NAME"),
+    )
     missing = _missing_config(search)
     if missing:
         print(

@@ -3,7 +3,7 @@
 This repository contains a minimal scaffold for a Slack bot with three components:
 
 1. `slack_bot.py` — a lightweight Slack Bolt bot served through Flask.
-2. `agentic_search.py` — an OpenAI Agents SDK search component for Atlassian Rovo / Confluence MCP.
+2. `agentic_search.py` — an OpenAI Agents SDK search component that searches Atlassian Rovo / Confluence first, then optionally falls back to GitHub MCP readonly tools for README/code context.
 3. `cli_search.py` — a small CLI wrapper around `AgenticSearch.search()`.
 
 ## Files
@@ -28,6 +28,8 @@ export CONFLUENCE_MCP_API_KEY="your-confluence-mcp-api-key"
 export ATLASSIAN_CLOUD_ID="your-atlassian-cloud-id"
 export CONFLUENCE_SPACE="YOURSPACE"
 export MCP_SERVER_NAME="atlassian-rovo"
+export GITHUB_PAT="your-github-pat"              # optional GitHub readonly fallback
+export GITHUB_ORG="beamtech"                     # optional; defaults to beamtech
 python slack_bot.py
 ```
 
@@ -99,6 +101,28 @@ Optional environment variables:
 - `CONFLUENCE_SPACE`
 - `MCP_SERVER_URL` (defaults to `https://mcp.atlassian.com/v1/mcp`)
 - `MCP_SERVER_NAME` (defaults to `atlassian-rovo`)
+- `GITHUB_PAT` (enables GitHub MCP readonly fallback)
+- `GITHUB_ORG` (defaults to `beamtech`; URLs like `https://github.com/beamtech` are normalized)
+- `GITHUB_MCP_SERVER_URL` (defaults to `https://api.githubcopilot.com/mcp/readonly`)
+- `GITHUB_MCP_SERVER_NAME` (defaults to `github`)
+
+### Optional GitHub MCP readonly fallback
+
+When `GITHUB_PAT` is set, AgenticSearch can also use GitHub's remote MCP server as a
+secondary source for `github.com/beamtech`.
+
+- Atlassian/Confluence is always searched first.
+- GitHub is only used when the Atlassian results are incomplete or point to code-level details.
+- GitHub retrieval is scoped to the configured org and should prioritize README files before source code.
+
+Optional GitHub env setup:
+
+```bash
+export GITHUB_PAT="your-github-pat"
+export GITHUB_ORG="beamtech"
+export GITHUB_MCP_SERVER_URL="https://api.githubcopilot.com/mcp/readonly"  # optional override
+export GITHUB_MCP_SERVER_NAME="github"                                      # optional override
+```
 
 ### Atlassian MCP auth
 
@@ -173,6 +197,7 @@ Basic credentials, and content body previews are not logged.
 - Responds to `app_mention` events with the same `AgenticSearch` answer
 - Responds to top-level `message.channels` events containing `?` with the same async placeholder → threaded reply flow
 - Ignores `message.channels` thread replies for the `?` trigger to avoid polluting existing threads
+- Searches Atlassian first and optionally uses GitHub MCP readonly tools as a secondary source for Beamtech README/code details
 - Lets Bolt handle Slack request verification and URL verification flows
 
 ## Next steps

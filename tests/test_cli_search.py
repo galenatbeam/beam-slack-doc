@@ -9,7 +9,7 @@ import cli_search
 
 def test_main_prints_answer_and_citations(monkeypatch, capsys):
     class FakeSearch:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self.openai_api_key = "test-openai-key"
             self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
@@ -48,7 +48,7 @@ def test_main_prints_json_when_requested(monkeypatch, capsys):
     }
 
     class FakeSearch:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self.openai_api_key = "test-openai-key"
             self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
@@ -70,7 +70,7 @@ def test_main_prints_json_when_requested(monkeypatch, capsys):
 
 def test_main_returns_error_for_missing_required_config(monkeypatch, capsys):
     class FakeSearch:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self.openai_api_key = ""
             self.atlassian_email = ""
             self.confluence_mcp_api_key = ""
@@ -94,7 +94,7 @@ def test_main_returns_error_for_missing_required_config(monkeypatch, capsys):
 
 def test_main_allows_local_mode_without_real_openai_api_key(monkeypatch, capsys):
     class FakeSearch:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self.openai_api_key = "ollama"
             self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
@@ -121,7 +121,7 @@ def test_main_allows_local_mode_without_real_openai_api_key(monkeypatch, capsys)
 
 def test_main_prints_debug_failure_summary_to_stderr_without_json(monkeypatch, capsys):
     class FakeSearch:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self.openai_api_key = "test-openai-key"
             self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
@@ -158,7 +158,7 @@ def test_main_prints_debug_failure_summary_to_stderr_without_json(monkeypatch, c
 
 def test_main_prints_ari_when_citation_has_no_url(monkeypatch, capsys):
     class FakeSearch:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self.openai_api_key = "test-openai-key"
             self.atlassian_email = "bot@example.com"
             self.confluence_mcp_api_key = "test-token"
@@ -206,3 +206,40 @@ def test_help_mentions_agentic_search_debug(capsys):
     assert "ATLASSIAN_EMAIL" in captured.out
     assert "CONFLUENCE_MCP_API_KEY" in captured.out
     assert "ATLASSIAN_CLOUD_ID" in captured.out
+    assert "GITHUB_PAT" in captured.out
+    assert "GITHUB_ORG" in captured.out
+
+
+def test_main_passes_github_env_configuration_to_agentic_search(monkeypatch, capsys):
+    captured_kwargs = {}
+
+    class FakeSearch:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            self.openai_api_key = "test-openai-key"
+            self.atlassian_email = "bot@example.com"
+            self.confluence_mcp_api_key = "test-token"
+            self.atlassian_cloud_id = "test-cloud-id"
+
+        def search(self, query: str):
+            assert query == "query"
+            return {"answer": "ok", "citations": [], "raw_response": {"status": "ok"}}
+
+    monkeypatch.setattr(cli_search, "load_dotenv", lambda: None)
+    monkeypatch.setattr(cli_search, "AgenticSearch", FakeSearch)
+    monkeypatch.setenv("GITHUB_PAT", "test-github-token")
+    monkeypatch.setenv("GITHUB_ORG", "beamtech")
+    monkeypatch.setenv("GITHUB_MCP_SERVER_URL", "https://api.githubcopilot.com/mcp/readonly")
+    monkeypatch.setenv("GITHUB_MCP_SERVER_NAME", "github")
+
+    exit_code = cli_search.main(["query"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "ok" in captured.out
+    assert captured_kwargs == {
+        "github_pat": "test-github-token",
+        "github_org": "beamtech",
+        "github_mcp_server_url": "https://api.githubcopilot.com/mcp/readonly",
+        "github_mcp_server_name": "github",
+    }

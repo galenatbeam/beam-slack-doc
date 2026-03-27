@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from contextlib import AsyncExitStack
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Mapping, Sequence
 
@@ -28,6 +29,9 @@ load_dotenv()
 
 DEFAULT_MCP_SERVER_URL = "https://mcp.atlassian.com/v1/mcp"
 DEFAULT_MCP_SERVER_NAME = "atlassian-rovo"
+DEFAULT_GITHUB_MCP_SERVER_URL = "https://api.githubcopilot.com/mcp/readonly"
+DEFAULT_GITHUB_MCP_SERVER_NAME = "github"
+DEFAULT_GITHUB_ORG = "beamtech"
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_OLLAMA_CHAT_MODEL = "qwen3:4b-instruct"
 LOCAL_LLM_API_KEY_PLACEHOLDER = "ollama"
@@ -35,6 +39,10 @@ MAX_FETCH_RESULTS = 3
 SHARED_SEARCH_TOOL = "search"
 SHARED_FETCH_TOOL = "fetch"
 ALLOWED_AGENT_TOOL_NAMES = frozenset({SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL})
+ATLASSIAN_SERVER_KEY = "atlassian"
+GITHUB_SERVER_KEY = "github"
+GITHUB_TOOL_NAME_PREFIX = f"{GITHUB_SERVER_KEY}__"
+GITHUB_TOOLSET_HEADER_VALUE = "repos,orgs"
 CONFLUENCE_SEARCH_TOOL = "searchConfluenceUsingCql"
 CONFLUENCE_FETCH_TOOL = "getConfluencePage"
 MAX_AGENT_RUN_ATTEMPTS = 2
@@ -56,6 +64,10 @@ CONTENT_KEYS = ("body", "content", "markdown", "value")
 CONFLUENCE_MCP_API_KEY_ENV = "CONFLUENCE_MCP_API_KEY"
 ATLASSIAN_EMAIL_ENV = "ATLASSIAN_EMAIL"
 ATLASSIAN_CLOUD_ID_ENV = "ATLASSIAN_CLOUD_ID"
+GITHUB_PAT_ENV = "GITHUB_PAT"
+GITHUB_ORG_ENV = "GITHUB_ORG"
+GITHUB_MCP_SERVER_URL_ENV = "GITHUB_MCP_SERVER_URL"
+GITHUB_MCP_SERVER_NAME_ENV = "GITHUB_MCP_SERVER_NAME"
 DEBUG_ENV_VAR = "AGENTIC_SEARCH_DEBUG"
 DEBUG_TRUE_VALUES = {"1", "true", "yes"}
 ERROR_PREVIEW_CHAR_LIMIT = 300
@@ -167,6 +179,29 @@ class AgentRunOutcome:
     run_used: int
 
 
+@dataclass(frozen=True)
+class MCPServerBinding:
+    """Connected MCP server metadata used for tool routing."""
+
+    key: str
+    name: str
+    url: str
+    server: Any
+
+
+@dataclass(frozen=True)
+class DiscoveredToolBinding:
+    """Discovered tool plus the originating server it must be called on."""
+
+    server_binding: MCPServerBinding
+    tool: Any
+    public_name: str
+
+    @property
+    def original_name(self) -> str:
+        return str(getattr(self.tool, "name", self.public_name))
+
+
 class AgenticSearch:
     """Search documentation via Atlassian Rovo MCP and synthesize a cited answer."""
 
@@ -181,6 +216,10 @@ class AgenticSearch:
         confluence_mcp_api_key: str | None = None,
         atlassian_email: str | None = None,
         atlassian_cloud_id: str | None = None,
+        github_pat: str | None = None,
+        github_org: str | None = None,
+        github_mcp_server_name: str | None = None,
+        github_mcp_server_url: str | None = None,
         max_results: int = 5,
     ) -> None:
         self.llm_base_url = (llm_base_url or os.getenv("LLM_BASE_URL", "")).strip()
@@ -190,12 +229,14 @@ class AgenticSearch:
             or env_openai_api_key
             or (LOCAL_LLM_API_KEY_PLACEHOLDER if self.uses_local_llm else "")
         )
-        self.confluence_space = confluence_space or os.getenv("CONFLUENCE_SPACE", "")
-        self.mcp_server_name = mcp_server_name or DEFAULT_MCP_SERVER_NAME
+        self.confluence_space = (confluence_space or os.getenv("CONFLUENCE_SPACE", "")).strip()
+        self.mcp_server_name = (
+            mcp_server_name or os.getenv("MCP_SERVER_NAME", DEFAULT_MCP_SERVER_NAME)
+        ).strip() or DEFAULT_MCP_SERVER_NAME
         self.model = self._resolve_model(model)
-        self.mcp_server_url = mcp_server_url or os.getenv(
+        self.mcp_server_url = (mcp_server_url or os.getenv(
             "MCP_SERVER_URL", DEFAULT_MCP_SERVER_URL
-        )
+        )).strip() or DEFAULT_MCP_SERVER_URL
         self.atlassian_email = (
             atlassian_email or os.getenv(ATLASSIAN_EMAIL_ENV, "")
         ).strip()
@@ -209,6 +250,18 @@ class AgenticSearch:
         self.atlassian_cloud_id = (
             atlassian_cloud_id or os.getenv(ATLASSIAN_CLOUD_ID_ENV, "")
         ).strip()
+        self.github_pat = (github_pat or os.getenv(GITHUB_PAT_ENV, "")).strip()
+        self.github_org = self._normalize_github_org(
+            github_org or os.getenv(GITHUB_ORG_ENV, DEFAULT_GITHUB_ORG)
+        )
+        self.github_mcp_server_name = (
+            github_mcp_server_name
+            or os.getenv(GITHUB_MCP_SERVER_NAME_ENV, DEFAULT_GITHUB_MCP_SERVER_NAME)
+        ).strip() or DEFAULT_GITHUB_MCP_SERVER_NAME
+        self.github_mcp_server_url = (
+            github_mcp_server_url
+            or os.getenv(GITHUB_MCP_SERVER_URL_ENV, DEFAULT_GITHUB_MCP_SERVER_URL)
+        ).strip() or DEFAULT_GITHUB_MCP_SERVER_URL
         self.max_results = max(1, max_results)
         self.debug_enabled = _env_flag(os.getenv(DEBUG_ENV_VAR))
         self._debug_state: dict[str, Any] | None = None
@@ -217,6 +270,10 @@ class AgenticSearch:
     @property
     def uses_local_llm(self) -> bool:
         return bool(self.llm_base_url)
+
+    @property
+    def github_enabled(self) -> bool:
+        return bool(self.github_pat)
 
     def missing_configuration(self) -> list[str]:
         missing: list[str] = []
@@ -228,6 +285,8 @@ class AgenticSearch:
             missing.append(CONFLUENCE_MCP_API_KEY_ENV)
         if not self.atlassian_cloud_id:
             missing.append(ATLASSIAN_CLOUD_ID_ENV)
+        if self.github_enabled and not self.github_org:
+            missing.append(GITHUB_ORG_ENV)
         return missing
 
     def search(self, query: str) -> Dict[str, Any]:
@@ -277,6 +336,20 @@ class AgenticSearch:
                 " This is a retry because the previous run returned without calling `search`."
             )
 
+        github_guidance = ""
+        has_github_tools = any(
+            name.startswith(GITHUB_TOOL_NAME_PREFIX)
+            for name in (discovered_tool_names or [])
+        )
+        if has_github_tools:
+            github_guidance = (
+                f" GitHub tools are secondary and use the `{GITHUB_TOOL_NAME_PREFIX}` prefix."
+                f" Always inspect Atlassian results from `search` first, and only use GitHub when"
+                f" the Atlassian docs are incomplete, need code-level confirmation, or point to repo"
+                f" implementation details. Scope GitHub retrieval to the `{self.github_org}` org,"
+                " prioritize README files first, then inspect only the most relevant source files."
+            )
+
         return (
             "You are a documentation search assistant. You MUST call the MCP tool named `search` "
             "at least once before giving a final answer. Do not answer from prior knowledge or "
@@ -286,6 +359,7 @@ class AgenticSearch:
             "citations using title + URL when available, otherwise title + ARI/ID."
             + tool_guidance
             + scope
+            + github_guidance
             + retry_guidance
         )
 
@@ -296,22 +370,89 @@ class AgenticSearch:
         self._configure_agents_sdk()
 
         self._set_last_step("mcp_connect")
-        async with self._build_mcp_server() as server:
-            try:
-                discovered_tools = await self._list_tools(server)
-            except Exception as exc:
-                return self._confluence_auth_issue_response(query, exc)
+        async with AsyncExitStack() as stack:
+            atlassian_server = await stack.enter_async_context(self._build_mcp_server())
+            server_bindings = [
+                MCPServerBinding(
+                    key=ATLASSIAN_SERVER_KEY,
+                    name=self.mcp_server_name,
+                    url=self.mcp_server_url,
+                    server=atlassian_server,
+                )
+            ]
+
+            if self.github_enabled:
+                try:
+                    github_server = await stack.enter_async_context(
+                        self._build_github_mcp_server()
+                    )
+                except Exception as exc:
+                    self._record_optional_server_warning(
+                        MCPServerBinding(
+                            key=GITHUB_SERVER_KEY,
+                            name=self.github_mcp_server_name,
+                            url=self.github_mcp_server_url,
+                            server=None,
+                        ),
+                        step="connect",
+                        exc=exc,
+                    )
+                else:
+                    server_bindings.append(
+                        MCPServerBinding(
+                            key=GITHUB_SERVER_KEY,
+                            name=self.github_mcp_server_name,
+                            url=self.github_mcp_server_url,
+                            server=github_server,
+                        )
+                    )
+
+            discovery_entries: list[dict[str, Any]] = []
+            discovered_tools: list[DiscoveredToolBinding] = []
+            for server_binding in server_bindings:
+                list_tools_step = (
+                    "list_tools"
+                    if server_binding.key == ATLASSIAN_SERVER_KEY
+                    else f"list_tools:{server_binding.key}"
+                )
+                try:
+                    server_tools = await self._list_tools(
+                        server_binding.server,
+                        step=list_tools_step,
+                    )
+                except Exception as exc:
+                    if server_binding.key == ATLASSIAN_SERVER_KEY:
+                        return self._confluence_auth_issue_response(query, exc)
+                    self._record_optional_server_warning(
+                        server_binding,
+                        step="list_tools",
+                        exc=exc,
+                    )
+                    continue
+
+                discovery_entries.append(
+                    {
+                        "called": True,
+                        "method": "list_tools",
+                        "server_key": server_binding.key,
+                        "server_name": server_binding.name,
+                        "tool_names": [
+                            tool.name for tool in server_tools if getattr(tool, "name", None)
+                        ],
+                    }
+                )
+                discovered_tools.extend(
+                    self._bind_discovered_tools(server_binding, server_tools)
+                )
+
+            self._record_tool_discovery(discovery_entries)
 
             if not discovered_tools:
                 raise RuntimeError("No MCP tools were discovered.")
 
-            discovered_tool_names = [
-                tool.name for tool in discovered_tools if getattr(tool, "name", None)
-            ]
+            discovered_tool_names = [tool.public_name for tool in discovered_tools]
             allowlisted_tools = self._allowlist_discovered_tools(discovered_tools)
-            allowlisted_tool_names = [
-                tool.name for tool in allowlisted_tools if getattr(tool, "name", None)
-            ]
+            allowlisted_tool_names = [tool.public_name for tool in allowlisted_tools]
 
             if SHARED_SEARCH_TOOL not in allowlisted_tool_names:
                 return self._required_search_tool_missing_response(
@@ -322,7 +463,6 @@ class AgenticSearch:
 
             outcome = await self._run_tool_calling_agent(
                 query,
-                server,
                 allowlisted_tools,
                 allowlisted_tool_names,
             )
@@ -353,53 +493,102 @@ class AgenticSearch:
                 "raw_response": self._with_debug(raw_response),
             }
 
-    def _allowlist_discovered_tools(self, discovered_tools: Sequence[Any]) -> list[Any]:
+    def _allowlist_discovered_tools(
+        self,
+        discovered_tools: Sequence[DiscoveredToolBinding],
+    ) -> list[DiscoveredToolBinding]:
         allowlisted_tools = [
-            tool
-            for tool in discovered_tools
-            if getattr(tool, "name", None) in ALLOWED_AGENT_TOOL_NAMES
+            tool_binding
+            for tool_binding in discovered_tools
+            if self._is_allowlisted_tool(tool_binding)
         ]
         self._record_debug(
             "tool_allowlist",
             {
                 "tool_names": [
-                    tool.name for tool in allowlisted_tools if getattr(tool, "name", None)
+                    tool.public_name for tool in allowlisted_tools
                 ]
             },
         )
         return allowlisted_tools
 
-    async def _list_tools(self, server: Any) -> list[Any]:
-        self._set_last_step("list_tools")
+    async def _list_tools(self, server: Any, *, step: str = "list_tools") -> list[Any]:
+        self._set_last_step(step)
         tools_result = await server.list_tools()
         tools = getattr(tools_result, "tools", tools_result)
-        discovered_tools = list(tools or [])
+        return list(tools or [])
+
+    def _bind_discovered_tools(
+        self,
+        server_binding: MCPServerBinding,
+        discovered_tools: Sequence[Any],
+    ) -> list[DiscoveredToolBinding]:
+        bindings: list[DiscoveredToolBinding] = []
+        for tool in discovered_tools:
+            tool_name = getattr(tool, "name", None)
+            if not tool_name:
+                continue
+            public_name = (
+                tool_name
+                if server_binding.key == ATLASSIAN_SERVER_KEY
+                else f"{server_binding.key}__{tool_name}"
+            )
+            bindings.append(
+                DiscoveredToolBinding(
+                    server_binding=server_binding,
+                    tool=tool,
+                    public_name=public_name,
+                )
+            )
+        return bindings
+
+    def _record_tool_discovery(self, discovery_entries: Sequence[Mapping[str, Any]]) -> None:
+        if not discovery_entries:
+            return
+        if len(discovery_entries) == 1 and discovery_entries[0].get("server_key") == ATLASSIAN_SERVER_KEY:
+            self._record_debug(
+                "tool_discovery",
+                {
+                    "called": True,
+                    "method": "list_tools",
+                    "tool_names": list(discovery_entries[0].get("tool_names", [])),
+                },
+            )
+            return
         self._record_debug(
             "tool_discovery",
             {
                 "called": True,
                 "method": "list_tools",
-                "tool_names": [tool.name for tool in discovered_tools if getattr(tool, "name", None)],
+                "servers": [dict(entry) for entry in discovery_entries],
             },
         )
-        return discovered_tools
+
+    def _is_allowlisted_tool(self, tool_binding: DiscoveredToolBinding) -> bool:
+        if tool_binding.server_binding.key == ATLASSIAN_SERVER_KEY:
+            return tool_binding.original_name in ALLOWED_AGENT_TOOL_NAMES
+        if tool_binding.server_binding.key == GITHUB_SERVER_KEY:
+            return True
+        return False
 
     def _build_discovered_function_tools(
         self,
-        server: Any,
-        discovered_tools: Sequence[Any],
+        discovered_tools: Sequence[DiscoveredToolBinding],
         collected_documents: list[DocumentResult],
         tool_invocations: list[str],
     ) -> list[FunctionTool]:
         return [
             self._build_discovered_function_tool(
-                server,
-                tool,
+                tool_binding.server_binding.server,
+                tool_binding.tool,
                 collected_documents,
                 tool_invocations,
+                public_name=tool_binding.public_name,
+                server_key=tool_binding.server_binding.key,
+                server_name=tool_binding.server_binding.name,
             )
-            for tool in discovered_tools
-            if getattr(tool, "name", None)
+            for tool_binding in discovered_tools
+            if getattr(tool_binding.tool, "name", None)
         ]
 
     def _build_discovered_function_tool(
@@ -408,11 +597,16 @@ class AgenticSearch:
         tool: Any,
         collected_documents: list[DocumentResult],
         tool_invocations: list[str],
+        *,
+        public_name: str | None = None,
+        server_key: str = ATLASSIAN_SERVER_KEY,
+        server_name: str | None = None,
     ) -> FunctionTool:
         tool_name = tool.name
+        exposed_tool_name = public_name or tool_name
         description = getattr(tool, "description", None) or f"MCP tool '{tool_name}'."
         params_json_schema = self._sanitize_tool_input_schema(
-            tool_name,
+            exposed_tool_name,
             getattr(tool, "inputSchema", None),
         )
 
@@ -420,13 +614,20 @@ class AgenticSearch:
             arguments = self._prepare_discovered_tool_arguments(
                 tool,
                 self._parse_tool_input(input_json),
+                server_key=server_key,
             )
-            tool_invocations.append(tool_name)
-            payload = await self._call_tool(server, tool_name, arguments)
-            documents = self._normalize_documents(payload, source=tool_name)
+            tool_invocations.append(exposed_tool_name)
+            payload = await self._call_tool(
+                server,
+                tool_name,
+                arguments,
+                debug_tool_name=exposed_tool_name,
+                server_name=server_name,
+            )
+            documents = self._normalize_documents(payload, source=exposed_tool_name)
             collected_documents.extend(documents)
             result: dict[str, Any] = {
-                "tool_name": tool_name,
+                "tool_name": exposed_tool_name,
                 "documents": [self._document_tool_view(document) for document in documents],
             }
             extracted = self._extract_payload(payload)
@@ -436,7 +637,7 @@ class AgenticSearch:
             return json.dumps(result, ensure_ascii=False)
 
         return FunctionTool(
-            name=tool_name,
+            name=exposed_tool_name,
             description=description,
             params_json_schema=params_json_schema,
             on_invoke_tool=on_invoke_tool,
@@ -641,9 +842,11 @@ class AgenticSearch:
         self,
         tool: Any,
         arguments: Mapping[str, Any],
+        *,
+        server_key: str = ATLASSIAN_SERVER_KEY,
     ) -> dict[str, Any]:
         prepared = dict(arguments)
-        if self.atlassian_cloud_id and self._tool_accepts_param(tool, "cloudId"):
+        if server_key == ATLASSIAN_SERVER_KEY and self.atlassian_cloud_id and self._tool_accepts_param(tool, "cloudId"):
             provided_cloud_id = prepared.get("cloudId")
             if (
                 "cloudId" in prepared
@@ -659,13 +862,72 @@ class AgenticSearch:
                     }
                 )
             prepared["cloudId"] = self.atlassian_cloud_id
+        if server_key == GITHUB_SERVER_KEY:
+            prepared = self._prepare_github_tool_arguments(tool, prepared)
         return prepared
+
+    def _prepare_github_tool_arguments(
+        self,
+        tool: Any,
+        arguments: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        prepared = dict(arguments)
+        if not self.github_org:
+            return prepared
+
+        github_scope_keys = [
+            key for key in ("owner", "org", "organization") if self._tool_accepts_param(tool, key)
+        ]
+        override_recorded = False
+        for key in github_scope_keys:
+            provided_value = prepared.get(key)
+            normalized_value = self._normalize_github_org(
+                provided_value if isinstance(provided_value, str) else ""
+            )
+            if (
+                not override_recorded
+                and key in prepared
+                and isinstance(provided_value, str)
+                and normalized_value
+                and normalized_value != self.github_org
+            ):
+                self._record_debug_warning(
+                    {
+                        "warning_type": "github_org_override",
+                        "tool_name": getattr(tool, "name", None),
+                        "provided_org": "[REDACTED]",
+                        "configured_org": "[REDACTED]",
+                    }
+                )
+                override_recorded = True
+            prepared[key] = self.github_org
+        return prepared
+
+    def _normalize_github_org(self, value: str | None) -> str:
+        candidate = (value or "").strip()
+        if not candidate:
+            return ""
+
+        candidate = re.sub(r"^https?://", "", candidate, flags=re.IGNORECASE)
+        candidate = candidate.removeprefix("git@github.com:")
+        candidate = candidate.removeprefix("@")
+        candidate = candidate.removeprefix("www.")
+        candidate = re.split(r"[?#]", candidate, maxsplit=1)[0].strip().strip("/")
+
+        if candidate.lower().startswith("github.com/"):
+            candidate = candidate[len("github.com/") :]
+
+        parts = [segment.strip() for segment in candidate.split("/") if segment.strip()]
+        if not parts:
+            return ""
+
+        normalized = parts[0].removesuffix(".git").strip()
+        return normalized.lower()
 
     async def _run_tool_calling_agent(
         self,
         query: str,
-        server: Any,
-        discovered_tools: Sequence[Any],
+        discovered_tools: Sequence[DiscoveredToolBinding],
         discovered_tool_names: Sequence[str],
     ) -> AgentRunOutcome:
         attempts: list[dict[str, Any]] = []
@@ -674,7 +936,6 @@ class AgenticSearch:
             collected_documents: list[DocumentResult] = []
             tool_invocations: list[str] = []
             tools = self._build_discovered_function_tools(
-                server,
                 discovered_tools,
                 collected_documents,
                 tool_invocations,
@@ -804,6 +1065,23 @@ class AgenticSearch:
             params={
                 "url": self.mcp_server_url,
                 "headers": {"Authorization": self.mcp_auth_header},
+                "timeout": 10,
+            },
+            cache_tools_list=False,
+            max_retry_attempts=2,
+        )
+
+    def _build_github_mcp_server(self) -> MCPServerStreamableHttp:
+        headers = {
+            "Authorization": f"Bearer {self.github_pat}",
+            "X-MCP-Readonly": "true",
+            "X-MCP-Toolsets": GITHUB_TOOLSET_HEADER_VALUE,
+        }
+        return MCPServerStreamableHttp(
+            name=self.github_mcp_server_name,
+            params={
+                "url": self.github_mcp_server_url,
+                "headers": headers,
                 "timeout": 10,
             },
             cache_tools_list=False,
@@ -1383,12 +1661,20 @@ class AgenticSearch:
         server: Any,
         tool_name: str,
         arguments: Mapping[str, Any],
+        *,
+        debug_tool_name: str | None = None,
+        server_name: str | None = None,
     ) -> Any:
-        self._set_last_step(f"call_tool:{tool_name}")
+        logged_tool_name = debug_tool_name or tool_name
+        self._set_last_step(f"call_tool:{logged_tool_name}")
         call_debug = {
-            "tool_name": tool_name,
+            "tool_name": logged_tool_name,
             "argument_keys": [key for key in arguments.keys() if not _is_sensitive_debug_key(key)],
         }
+        if server_name:
+            call_debug["server_name"] = server_name
+        if logged_tool_name != tool_name:
+            call_debug["server_tool_name"] = tool_name
         try:
             payload = await server.call_tool(tool_name, dict(arguments))
         except Exception as exc:
@@ -1415,14 +1701,41 @@ class AgenticSearch:
         self._debug_state = {
             "mcp_server_url": self.mcp_server_url,
             "mcp_server_name": self.mcp_server_name,
+            "github_enabled": self.github_enabled,
             "calls": [],
         }
+        if self.github_enabled:
+            self._debug_state["github_mcp_server_url"] = self.github_mcp_server_url
+            self._debug_state["github_mcp_server_name"] = self.github_mcp_server_name
+            self._debug_state["github_org"] = self.github_org
         self._record_debug(
             "mcp_server",
             {
                 "mcp_server_url": self.mcp_server_url,
                 "mcp_server_name": self.mcp_server_name,
+                "github_enabled": self.github_enabled,
+                "github_mcp_server_url": self.github_mcp_server_url if self.github_enabled else None,
+                "github_mcp_server_name": self.github_mcp_server_name if self.github_enabled else None,
+                "github_org": self.github_org if self.github_enabled else None,
             },
+        )
+
+    def _record_optional_server_warning(
+        self,
+        server_binding: MCPServerBinding,
+        *,
+        step: str,
+        exc: Exception,
+    ) -> None:
+        self._record_debug_warning(
+            {
+                "warning_type": "optional_server_unavailable",
+                "server_key": server_binding.key,
+                "server_name": server_binding.name,
+                "step": step,
+                "error_type": type(exc).__name__,
+                "error_message": self._preview_text(str(exc)),
+            }
         )
 
     def _set_last_step(self, step: str) -> None:

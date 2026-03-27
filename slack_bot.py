@@ -70,6 +70,10 @@ class SlackHttpBot:
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             confluence_space=os.getenv("CONFLUENCE_SPACE", ""),
             mcp_server_name=os.getenv("MCP_SERVER_NAME", "confluence-search"),
+            github_pat=os.getenv("GITHUB_PAT"),
+            github_org=os.getenv("GITHUB_ORG"),
+            github_mcp_server_name=os.getenv("GITHUB_MCP_SERVER_NAME"),
+            github_mcp_server_url=os.getenv("GITHUB_MCP_SERVER_URL"),
         )
         self.executor = executor or ThreadPoolExecutor(max_workers=4, thread_name_prefix="slack-search")
         self.event_cache = event_cache or RecentEventCache()

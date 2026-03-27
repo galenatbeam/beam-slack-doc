@@ -14,6 +14,7 @@ from agentic_search import (
     Citation,
     CONFLUENCE_AUTH_ISSUE_MESSAGE,
     DEFAULT_OLLAMA_CHAT_MODEL,
+    GITHUB_TOOL_NAME_PREFIX,
     PAYLOAD_PREVIEW_CHAR_LIMIT,
     REQUIRED_SEARCH_TOOL_MISSING_MESSAGE,
     REQUIRED_SEARCH_TOOL_NOT_CALLED_MESSAGE,
@@ -77,19 +78,34 @@ def make_tool(
     )
 
 
-def make_search() -> AgenticSearch:
-    return AgenticSearch(
-        openai_api_key="test-openai-key",
-        atlassian_email="bot@example.com",
-        confluence_mcp_api_key="test-mcp-token",
-        atlassian_cloud_id="test-cloud-id",
-        model="gpt-4.1-mini",
-    )
+def make_search(**overrides) -> AgenticSearch:
+    defaults = {
+        "openai_api_key": "test-openai-key",
+        "atlassian_email": "bot@example.com",
+        "confluence_mcp_api_key": "test-mcp-token",
+        "atlassian_cloud_id": "test-cloud-id",
+        "model": "gpt-4.1-mini",
+    }
+    defaults.update(overrides)
+    return AgenticSearch(**defaults)
 
 
 def test_sensitive_debug_key_detection_normalizes_camel_case_variants():
     for key in ["token", "authorization", "api_token", "api-token", "API_TOKEN", "apiToken"]:
         assert _is_sensitive_debug_key(key) is True
+
+
+def test_build_agent_instructions_marks_github_as_secondary_after_atlassian_search():
+    search = make_search(github_pat="test-github-token", github_org="https://github.com/BeamTech")
+
+    instructions = search.build_agent_instructions(
+        [SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL, f"{GITHUB_TOOL_NAME_PREFIX}search_repositories"]
+    )
+
+    assert "Always inspect Atlassian results from `search` first" in instructions
+    assert "prioritize README files first" in instructions
+    assert GITHUB_TOOL_NAME_PREFIX in instructions
+    assert "`beamtech` org" in instructions
 
 
 def make_discovered_tools() -> list[Tool]:
@@ -111,6 +127,19 @@ def make_discovered_tools() -> list[Tool]:
             },
             required=["ari"],
         ),
+    ]
+
+
+def make_github_tools() -> list[Tool]:
+    return [
+        make_tool(
+            "search_repositories",
+            {
+                "query": {"type": "string"},
+                "owner": {"type": "string"},
+            },
+            required=["query"],
+        )
     ]
 
 
@@ -312,6 +341,22 @@ def test_search_returns_configuration_error_when_cloud_id_is_missing(monkeypatch
     assert result["raw_response"]["missing_variables"] == ["ATLASSIAN_CLOUD_ID"]
 
 
+def test_search_returns_configuration_error_when_github_pat_is_set_but_org_is_blank(monkeypatch):
+    monkeypatch.setenv("GITHUB_ORG", "")
+    search = AgenticSearch(
+        openai_api_key="test-openai-key",
+        atlassian_email="bot@example.com",
+        confluence_mcp_api_key="test-mcp-token",
+        atlassian_cloud_id="test-cloud-id",
+        github_pat="test-github-token",
+    )
+
+    result = search.search("What failed?")
+
+    assert result["raw_response"]["status"] == "configuration_error"
+    assert result["raw_response"]["missing_variables"] == ["GITHUB_ORG"]
+
+
 def test_default_mode_lists_tools_and_uses_agent_tool_wrapper(rovo_search_structured_results_payload):
     server = FakeServer(
         tools=make_discovered_tools(),
@@ -393,6 +438,83 @@ def test_default_mode_lists_tools_and_uses_agent_tool_wrapper(rovo_search_struct
     ]
     assert result["raw_response"]["selected_tools"] == [SHARED_FETCH_TOOL, SHARED_SEARCH_TOOL]
     run_agent.assert_awaited_once()
+
+
+def test_search_discovers_github_tools_and_injects_configured_org(rovo_search_structured_results_payload):
+    atlassian_server = FakeServer(
+        tools=make_discovered_tools(),
+        responses={SHARED_SEARCH_TOOL: rovo_search_structured_results_payload},
+    )
+    github_server = FakeServer(
+        tools=make_github_tools(),
+        responses={
+            "search_repositories": {
+                "title": "beam-slack-doc",
+                "url": "https://github.com/beamtech/beam-slack-doc",
+                "excerpt": "Slack bot README and implementation.",
+            }
+        },
+    )
+    search = make_search(github_pat="test-github-token", github_org="https://github.com/BeamTech")
+
+    async def fake_runner(agent, prompt, **_kwargs):
+        assert prompt == "What is Beam Benefits?"
+        assert {tool.name for tool in agent.tools} == {
+            SHARED_SEARCH_TOOL,
+            SHARED_FETCH_TOOL,
+            f"{GITHUB_TOOL_NAME_PREFIX}search_repositories",
+        }
+        assert "Always inspect Atlassian results from `search` first" in agent.instructions
+        await invoke_discovered_tools(
+            agent,
+            [
+                (SHARED_SEARCH_TOOL, {"query": prompt}),
+                (
+                    f"{GITHUB_TOOL_NAME_PREFIX}search_repositories",
+                    {"query": "beam slack bot", "owner": "other-org"},
+                ),
+            ],
+        )
+        return FakeRunResult(
+            SynthesizedAnswer(
+                answer="Combined answer.",
+                citations=[
+                    Citation(
+                        title="Beam Benefits Overview",
+                        url="https://example.com/beam-overview",
+                    )
+                ],
+            )
+        )
+
+    with (
+        patch(
+            "agentic_search.MCPServerStreamableHttp",
+            side_effect=[atlassian_server, github_server],
+        ),
+        patch("agentic_search.Runner.run", new=AsyncMock(side_effect=fake_runner)),
+    ):
+        result = search.search("What is Beam Benefits?")
+
+    assert result["raw_response"]["status"] == "ok"
+    assert result["raw_response"]["discovered_tools"] == [
+        SHARED_SEARCH_TOOL,
+        SHARED_FETCH_TOOL,
+        f"{GITHUB_TOOL_NAME_PREFIX}search_repositories",
+    ]
+    assert result["raw_response"]["allowlisted_tools"] == [
+        SHARED_SEARCH_TOOL,
+        SHARED_FETCH_TOOL,
+        f"{GITHUB_TOOL_NAME_PREFIX}search_repositories",
+    ]
+    assert atlassian_server.list_tools_calls == 1
+    assert github_server.list_tools_calls == 1
+    assert github_server.calls == [
+        (
+            "search_repositories",
+            {"query": "beam slack bot", "owner": "beamtech"},
+        )
+    ]
 
 
 def test_allowlist_excludes_non_search_and_fetch_tools(rovo_search_structured_results_payload):
