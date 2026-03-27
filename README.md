@@ -171,7 +171,8 @@ Basic credentials, and content body previews are not logged.
 - Uses `slack_bolt` with Flask adapter wiring
 - Responds to `/search-docs` slash commands with an `AgenticSearch` answer
 - Responds to `app_mention` events with the same `AgenticSearch` answer
-- Responds to `message.channels` events containing `?` with the same async placeholder → threaded reply flow
+- Responds to top-level `message.channels` events containing `?` with the same async placeholder → threaded reply flow
+- Ignores `message.channels` thread replies for the `?` trigger to avoid polluting existing threads
 - Lets Bolt handle Slack request verification and URL verification flows
 
 ## Next steps

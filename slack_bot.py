@@ -137,7 +137,10 @@ class SlackHttpBot:
         if not self.is_channel_message(event, channel):
             return
 
-        thread_ts = self.resolve_thread_ts(event)
+        if self.is_thread_reply(event):
+            return
+
+        thread_ts = str(event.get("ts") or "").strip()
         if not thread_ts:
             return
 
@@ -250,6 +253,12 @@ class SlackHttpBot:
     def resolve_thread_ts(event: Dict[str, object]) -> str:
         value = event.get("thread_ts") or event.get("ts")
         return str(value or "").strip()
+
+    @staticmethod
+    def is_thread_reply(event: Dict[str, object]) -> bool:
+        thread_ts = str(event.get("thread_ts") or "").strip()
+        ts = str(event.get("ts") or "").strip()
+        return bool(thread_ts and thread_ts != ts)
 
     @staticmethod
     def is_channel_message(event: Dict[str, object], channel: str | None = None) -> bool:
