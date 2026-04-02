@@ -20,29 +20,24 @@ from agents import (
     set_tracing_disabled,
 )
 from agents.mcp import MCPServerStreamableHttp
-from agents.tool import FunctionTool
 from document_normalization import (
     extract_payload,
     extract_text_blob,
     fallback_citations,
-    first_string,
-    iter_candidate_dicts,
-    iter_nested_dicts,
     merge_document,
-    maybe_parse_json,
     normalize_citations,
     normalize_documents,
 )
 from dotenv import load_dotenv
+from mcp.types import CallToolResult
 from openai import AsyncOpenAI
+from policy_mcp_server import ScopedMCPServer, ScopedToolBinding
 from search_models import (
     AgentRunOutcome,
     Citation,
-    DiscoveredToolBinding,
     DocumentResult,
     MCPServerBinding,
     SynthesizedAnswer,
-    ToolStrategy,
 )
 from tool_argument_policy import (
     normalize_github_org,
@@ -68,8 +63,6 @@ ATLASSIAN_SERVER_KEY = "atlassian"
 GITHUB_SERVER_KEY = "github"
 GITHUB_TOOL_NAME_PREFIX = f"{GITHUB_SERVER_KEY}__"
 GITHUB_TOOLSET_HEADER_VALUE = "repos,orgs"
-CONFLUENCE_SEARCH_TOOL = "searchConfluenceUsingCql"
-CONFLUENCE_FETCH_TOOL = "getConfluencePage"
 MAX_AGENT_RUN_ATTEMPTS = 2
 REQUIRED_SEARCH_TOOL_MISSING_MESSAGE = (
     "Required Rovo shared tool `search` was not discovered from the MCP server. "
@@ -112,9 +105,6 @@ AUTH_TEXT_PATTERNS = (
     (re.compile(r"(?i)authorization\s*[:=]\s*basic\s+[^\s,;]+"), "[REDACTED_AUTH]"),
     (re.compile(r"(?i)bearer\s+[^\s,;]+"), "[REDACTED_AUTH]"),
     (re.compile(r"(?i)basic\s+[^\s,;]+"), "[REDACTED_AUTH]"),
-)
-SUPPORTED_TOOL_SCHEMA_KEYS = frozenset(
-    {"type", "properties", "required", "description", "items", "enum", "anyOf", "oneOf"}
 )
 
 
@@ -213,6 +203,7 @@ class AgenticSearch:
         self.debug_enabled = _env_flag(os.getenv(DEBUG_ENV_VAR))
         self._debug_state: dict[str, Any] | None = None
         self._debug_last_step: str | None = None
+        self._active_tool_run_state: dict[str, Any] | None = None
 
     @property
     def uses_local_llm(self) -> bool:
@@ -355,18 +346,18 @@ class AgenticSearch:
                     )
 
             discovery_entries: list[dict[str, Any]] = []
-            discovered_tools: list[DiscoveredToolBinding] = []
+            discovered_tool_names: list[str] = []
+            allowlisted_tool_names: list[str] = []
+            scoped_servers: list[ScopedMCPServer] = []
             for server_binding in server_bindings:
+                scoped_server = self._build_scoped_mcp_server(server_binding)
                 list_tools_step = (
                     "list_tools"
                     if server_binding.key == ATLASSIAN_SERVER_KEY
                     else f"list_tools:{server_binding.key}"
                 )
                 try:
-                    server_tools = await self._list_tools(
-                        server_binding.server,
-                        step=list_tools_step,
-                    )
+                    await self._list_tools(scoped_server, step=list_tools_step)
                 except Exception as exc:
                     if server_binding.key == ATLASSIAN_SERVER_KEY:
                         return self._confluence_auth_issue_response(query, exc)
@@ -383,23 +374,18 @@ class AgenticSearch:
                         "method": "list_tools",
                         "server_key": server_binding.key,
                         "server_name": server_binding.name,
-                        "tool_names": [
-                            tool.name for tool in server_tools if getattr(tool, "name", None)
-                        ],
+                        "tool_names": scoped_server.discovered_tool_names,
                     }
                 )
-                discovered_tools.extend(
-                    self._bind_discovered_tools(server_binding, server_tools)
-                )
+                discovered_tool_names.extend(scoped_server.discovered_tool_names)
+                allowlisted_tool_names.extend(scoped_server.allowlisted_tool_names)
+                scoped_servers.append(scoped_server)
 
             self._record_tool_discovery(discovery_entries)
+            self._record_tool_allowlist(allowlisted_tool_names)
 
-            if not discovered_tools:
+            if not discovered_tool_names:
                 raise RuntimeError("No MCP tools were discovered.")
-
-            discovered_tool_names = [tool.public_name for tool in discovered_tools]
-            allowlisted_tools = self._allowlist_discovered_tools(discovered_tools)
-            allowlisted_tool_names = [tool.public_name for tool in allowlisted_tools]
 
             if SHARED_SEARCH_TOOL not in allowlisted_tool_names:
                 return self._required_search_tool_missing_response(
@@ -410,7 +396,7 @@ class AgenticSearch:
 
             outcome = await self._run_tool_calling_agent(
                 query,
-                allowlisted_tools,
+                scoped_servers,
                 allowlisted_tool_names,
             )
 
@@ -440,24 +426,11 @@ class AgenticSearch:
                 "raw_response": self._with_debug(raw_response),
             }
 
-    def _allowlist_discovered_tools(
-        self,
-        discovered_tools: Sequence[DiscoveredToolBinding],
-    ) -> list[DiscoveredToolBinding]:
-        allowlisted_tools = [
-            tool_binding
-            for tool_binding in discovered_tools
-            if self._is_allowlisted_tool(tool_binding)
-        ]
+    def _record_tool_allowlist(self, tool_names: Sequence[str]) -> None:
         self._record_debug(
             "tool_allowlist",
-            {
-                "tool_names": [
-                    tool.public_name for tool in allowlisted_tools
-                ]
-            },
+            {"tool_names": list(tool_names)},
         )
-        return allowlisted_tools
 
     async def _list_tools(self, server: Any, *, step: str = "list_tools") -> list[Any]:
         self._set_last_step(step)
@@ -465,29 +438,33 @@ class AgenticSearch:
         tools = getattr(tools_result, "tools", tools_result)
         return list(tools or [])
 
-    def _bind_discovered_tools(
+    def _build_scoped_mcp_server(
         self,
         server_binding: MCPServerBinding,
-        discovered_tools: Sequence[Any],
-    ) -> list[DiscoveredToolBinding]:
-        bindings: list[DiscoveredToolBinding] = []
-        for tool in discovered_tools:
-            tool_name = getattr(tool, "name", None)
-            if not tool_name:
-                continue
-            public_name = (
-                tool_name
+    ) -> ScopedMCPServer:
+        async def tool_executor(
+            binding: ScopedToolBinding,
+            arguments: dict[str, Any] | None,
+            meta: dict[str, Any] | None,
+        ) -> Any:
+            return await self._execute_scoped_tool_call(
+                server_binding,
+                binding,
+                arguments,
+                meta,
+            )
+
+        return ScopedMCPServer(
+            server_binding.server,
+            name_prefix=("" if server_binding.key == ATLASSIAN_SERVER_KEY else GITHUB_TOOL_NAME_PREFIX),
+            allowed_tool_names=(
+                set(ALLOWED_AGENT_TOOL_NAMES)
                 if server_binding.key == ATLASSIAN_SERVER_KEY
-                else f"{server_binding.key}__{tool_name}"
-            )
-            bindings.append(
-                DiscoveredToolBinding(
-                    server_binding=server_binding,
-                    tool=tool,
-                    public_name=public_name,
-                )
-            )
-        return bindings
+                else None
+            ),
+            tool_executor=tool_executor,
+            sanitized_schema_recorder=self._record_sanitized_tool_schema,
+        )
 
     def _record_tool_discovery(self, discovery_entries: Sequence[Mapping[str, Any]]) -> None:
         if not discovery_entries:
@@ -511,236 +488,58 @@ class AgenticSearch:
             },
         )
 
-    def _is_allowlisted_tool(self, tool_binding: DiscoveredToolBinding) -> bool:
-        if tool_binding.server_binding.key == ATLASSIAN_SERVER_KEY:
-            return tool_binding.original_name in ALLOWED_AGENT_TOOL_NAMES
-        if tool_binding.server_binding.key == GITHUB_SERVER_KEY:
-            return True
-        return False
-
-    def _build_discovered_function_tools(
+    async def _execute_scoped_tool_call(
         self,
-        discovered_tools: Sequence[DiscoveredToolBinding],
-        collected_documents: list[DocumentResult],
-        tool_invocations: list[str],
-    ) -> list[FunctionTool]:
-        return [
-            self._build_discovered_function_tool(
-                tool_binding.server_binding.server,
-                tool_binding.tool,
-                collected_documents,
-                tool_invocations,
-                public_name=tool_binding.public_name,
-                server_key=tool_binding.server_binding.key,
-                server_name=tool_binding.server_binding.name,
-            )
-            for tool_binding in discovered_tools
-            if getattr(tool_binding.tool, "name", None)
-        ]
-
-    def _build_discovered_function_tool(
-        self,
-        server: Any,
-        tool: Any,
-        collected_documents: list[DocumentResult],
-        tool_invocations: list[str],
-        *,
-        public_name: str | None = None,
-        server_key: str = ATLASSIAN_SERVER_KEY,
-        server_name: str | None = None,
-    ) -> FunctionTool:
-        tool_name = tool.name
-        exposed_tool_name = public_name or tool_name
-        description = getattr(tool, "description", None) or f"MCP tool '{tool_name}'."
-        params_json_schema = self._sanitize_tool_input_schema(
-            exposed_tool_name,
-            getattr(tool, "inputSchema", None),
+        server_binding: MCPServerBinding,
+        binding: ScopedToolBinding,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None,
+    ) -> Any:
+        prepared_arguments = self._prepare_discovered_tool_arguments(
+            binding.tool,
+            arguments or {},
+            server_key=server_binding.key,
         )
-
-        async def on_invoke_tool(_ctx: Any, input_json: str) -> str:
-            arguments = self._prepare_discovered_tool_arguments(
-                tool,
-                self._parse_tool_input(input_json),
-                server_key=server_key,
-            )
-            tool_invocations.append(exposed_tool_name)
-            payload = await self._call_tool(
-                server,
-                tool_name,
-                arguments,
-                debug_tool_name=exposed_tool_name,
-                server_name=server_name,
-            )
-            documents = self._normalize_documents(payload, source=exposed_tool_name)
-            collected_documents.extend(documents)
-            result: dict[str, Any] = {
-                "tool_name": exposed_tool_name,
-                "documents": [self._document_tool_view(document) for document in documents],
-            }
-            extracted = self._extract_payload(payload)
-            text_blob = self._extract_text_blob(extracted)
-            if text_blob and not documents:
-                result["content"] = self._truncate_text(text_blob, TOOL_CONTENT_CHAR_LIMIT)
-            return json.dumps(result, ensure_ascii=False)
-
-        return FunctionTool(
-            name=exposed_tool_name,
-            description=description,
-            params_json_schema=params_json_schema,
-            on_invoke_tool=on_invoke_tool,
+        active_state = self._active_tool_run_state
+        if active_state is not None:
+            active_state.setdefault("tool_invocations", []).append(binding.public_name)
+        payload = await self._call_tool(
+            server_binding.server,
+            binding.original_name,
+            prepared_arguments,
+            debug_tool_name=binding.public_name,
+            server_name=server_binding.name,
+            meta=meta,
         )
+        if active_state is not None:
+            active_state.setdefault("collected_documents", []).extend(
+                self._normalize_documents(payload, source=binding.public_name)
+            )
+        return self._coerce_tool_payload_to_call_result(payload)
 
-    def _sanitize_tool_input_schema(self, tool_name: str, input_schema: Any) -> dict[str, Any]:
-        if not isinstance(input_schema, Mapping):
-            return {"type": "object", "properties": {}}
-
-        stripped_keys: list[str] = []
-        sanitized = self._sanitize_tool_schema_node(input_schema, "$", stripped_keys)
-
-        if sanitized.get("type") != "object":
-            stripped_keys.append("$.type")
-            sanitized = {"type": "object", "properties": {}}
-        else:
-            sanitized["type"] = "object"
-            if not isinstance(sanitized.get("properties"), dict):
-                sanitized["properties"] = {}
-
-        required = sanitized.get("required")
-        if isinstance(required, list):
-            filtered_required = [
-                item for item in required if isinstance(item, str) and item in sanitized["properties"]
-            ]
-            if filtered_required:
-                sanitized["required"] = filtered_required
-            else:
-                sanitized.pop("required", None)
-        else:
-            sanitized.pop("required", None)
-
-        if stripped_keys or sanitized != input_schema:
-            self._record_sanitized_tool_schema(tool_name, input_schema, sanitized, stripped_keys)
-
-        return sanitized
-
-    def _sanitize_tool_schema_node(
-        self,
-        schema: Mapping[str, Any],
-        path: str,
-        stripped_keys: list[str],
-    ) -> dict[str, Any]:
-        sanitized: dict[str, Any] = {}
-
-        for key, value in schema.items():
-            key_path = self._schema_path(path, str(key))
-            if key not in SUPPORTED_TOOL_SCHEMA_KEYS:
-                stripped_keys.append(key_path)
-                continue
-
-            if key == "type":
-                normalized_type = self._normalize_schema_type(value)
-                if normalized_type is None:
-                    stripped_keys.append(key_path)
-                    continue
-                sanitized[key] = normalized_type
-                continue
-
-            if key == "properties":
-                if not isinstance(value, Mapping):
-                    stripped_keys.append(key_path)
-                    continue
-                sanitized[key] = {
-                    str(property_name): self._sanitize_tool_schema_child(
-                        property_schema,
-                        self._schema_path(key_path, str(property_name)),
-                        stripped_keys,
-                    )
-                    for property_name, property_schema in value.items()
-                }
-                continue
-
-            if key == "required":
-                if not isinstance(value, list):
-                    stripped_keys.append(key_path)
-                    continue
-                sanitized[key] = [item for item in value if isinstance(item, str)]
-                continue
-
-            if key == "description":
-                if isinstance(value, str) and value.strip():
-                    sanitized[key] = value
-                else:
-                    stripped_keys.append(key_path)
-                continue
-
-            if key == "enum":
-                if not isinstance(value, list):
-                    stripped_keys.append(key_path)
-                    continue
-                sanitized[key] = [
-                    item
-                    for item in value
-                    if item is None or isinstance(item, (str, int, float, bool))
-                ]
-                continue
-
-            if key == "items":
-                if isinstance(value, Mapping):
-                    sanitized[key] = self._sanitize_tool_schema_node(value, key_path, stripped_keys)
-                elif isinstance(value, list):
-                    sanitized[key] = [
-                        self._sanitize_tool_schema_child(item, f"{key_path}[{index}]", stripped_keys)
-                        for index, item in enumerate(value)
-                    ]
-                else:
-                    stripped_keys.append(key_path)
-                continue
-
-            if key in {"anyOf", "oneOf"}:
-                if not isinstance(value, list):
-                    stripped_keys.append(key_path)
-                    continue
-                options = [
-                    self._sanitize_tool_schema_child(item, f"{key_path}[{index}]", stripped_keys)
-                    for index, item in enumerate(value)
-                ]
-                if options:
-                    sanitized[key] = options
-                else:
-                    stripped_keys.append(key_path)
-
-        if sanitized.get("type") == "object":
-            sanitized.setdefault("properties", {})
-            required = sanitized.get("required")
-            if isinstance(required, list):
-                filtered_required = [
-                    item for item in required if item in sanitized["properties"]
-                ]
-                if filtered_required:
-                    sanitized["required"] = filtered_required
-                else:
-                    sanitized.pop("required", None)
-        elif "required" in sanitized:
-            sanitized.pop("required", None)
-
-        return sanitized
-
-    def _sanitize_tool_schema_child(self, schema: Any, path: str, stripped_keys: list[str]) -> dict[str, Any]:
-        if not isinstance(schema, Mapping):
-            stripped_keys.append(path)
-            return {}
-        return self._sanitize_tool_schema_node(schema, path, stripped_keys)
-
-    def _normalize_schema_type(self, value: Any) -> str | None:
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            non_null_types = [item for item in value if isinstance(item, str) and item != "null"]
-            if len(non_null_types) == 1:
-                return non_null_types[0]
-        return None
-
-    def _schema_path(self, path: str, key: str) -> str:
-        return f"{path}.{key}" if path else key
+    def _coerce_tool_payload_to_call_result(self, payload: Any) -> CallToolResult:
+        if isinstance(payload, CallToolResult):
+            return payload
+        if hasattr(payload, "content") or hasattr(payload, "structuredContent"):
+            structured_content = getattr(payload, "structuredContent", None)
+            if not isinstance(structured_content, Mapping):
+                structured_content = None
+            content = getattr(payload, "content", None)
+            if not isinstance(content, list):
+                content = []
+            return CallToolResult(
+                content=content,
+                structuredContent=dict(structured_content) if structured_content is not None else None,
+                isError=bool(getattr(payload, "isError", False)),
+            )
+        if isinstance(payload, Mapping):
+            return CallToolResult(content=[], structuredContent=dict(payload))
+        if isinstance(payload, list):
+            return CallToolResult(content=[], structuredContent={"items": payload})
+        return CallToolResult(
+            content=[],
+            structuredContent={"value": payload},
+        )
 
     def _record_sanitized_tool_schema(
         self,
@@ -773,17 +572,6 @@ class AgenticSearch:
             f"[AgenticSearch debug] sanitized_tool_schema: {json.dumps(sanitized_entry, ensure_ascii=False)}",
             file=sys.stderr,
         )
-
-    def _parse_tool_input(self, input_json: str) -> dict[str, Any]:
-        stripped = input_json.strip()
-        if not stripped or stripped == "null":
-            return {}
-        parsed = json.loads(stripped)
-        if parsed is None:
-            return {}
-        if not isinstance(parsed, dict):
-            raise RuntimeError("Tool arguments must be a JSON object.")
-        return parsed
 
     def _prepare_discovered_tool_arguments(
         self,
@@ -841,7 +629,7 @@ class AgenticSearch:
     async def _run_tool_calling_agent(
         self,
         query: str,
-        discovered_tools: Sequence[DiscoveredToolBinding],
+        mcp_servers: Sequence[ScopedMCPServer],
         discovered_tool_names: Sequence[str],
     ) -> AgentRunOutcome:
         attempts: list[dict[str, Any]] = []
@@ -849,18 +637,20 @@ class AgenticSearch:
         for run_number in range(1, MAX_AGENT_RUN_ATTEMPTS + 1):
             collected_documents: list[DocumentResult] = []
             tool_invocations: list[str] = []
-            tools = self._build_discovered_function_tools(
-                discovered_tools,
-                collected_documents,
-                tool_invocations,
-            )
-            synthesized, used_plain_text_fallback = await self._run_tool_calling_agent_once(
-                query,
-                tools,
-                discovered_tool_names,
-                collected_documents,
-                run_number,
-            )
+            self._active_tool_run_state = {
+                "collected_documents": collected_documents,
+                "tool_invocations": tool_invocations,
+            }
+            try:
+                synthesized, used_plain_text_fallback = await self._run_tool_calling_agent_once(
+                    query,
+                    mcp_servers,
+                    discovered_tool_names,
+                    collected_documents,
+                    run_number,
+                )
+            finally:
+                self._active_tool_run_state = None
             attempt_summary = {
                 "run": run_number,
                 "tool_invocation_count": len(tool_invocations),
@@ -889,7 +679,7 @@ class AgenticSearch:
     async def _run_tool_calling_agent_once(
         self,
         query: str,
-        tools: Sequence[FunctionTool],
+        mcp_servers: Sequence[ScopedMCPServer],
         discovered_tool_names: Sequence[str],
         collected_documents: Sequence[DocumentResult],
         run_number: int,
@@ -899,7 +689,7 @@ class AgenticSearch:
             return (
                 await self._run_tool_calling_agent_structured(
                     query,
-                    tools,
+                    mcp_servers,
                     discovered_tool_names,
                     run_number,
                 ),
@@ -911,7 +701,7 @@ class AgenticSearch:
             return (
                 await self._run_tool_calling_agent_plain_text(
                     query,
-                    tools,
+                    mcp_servers,
                     discovered_tool_names,
                     collected_documents,
                     run_number,
@@ -922,7 +712,7 @@ class AgenticSearch:
     async def _run_tool_calling_agent_structured(
         self,
         query: str,
-        tools: Sequence[FunctionTool],
+        mcp_servers: Sequence[ScopedMCPServer],
         discovered_tool_names: Sequence[str],
         run_number: int,
     ) -> SynthesizedAnswer:
@@ -933,7 +723,7 @@ class AgenticSearch:
                 run_number=run_number,
             ),
             model=self.model,
-            tools=list(tools),
+            mcp_servers=list(mcp_servers),
             output_type=SynthesizedAnswer,
         )
         result = await Runner.run(agent, query)
@@ -942,7 +732,7 @@ class AgenticSearch:
     async def _run_tool_calling_agent_plain_text(
         self,
         query: str,
-        tools: Sequence[FunctionTool],
+        mcp_servers: Sequence[ScopedMCPServer],
         discovered_tool_names: Sequence[str],
         collected_documents: Sequence[DocumentResult],
         run_number: int,
@@ -957,7 +747,7 @@ class AgenticSearch:
                 + " Return a concise plain-text answer only. Do not emit JSON or XML."
             ),
             model=self.model,
-            tools=list(tools),
+            mcp_servers=list(mcp_servers),
         )
         result = await Runner.run(agent, query)
         answer = getattr(result, "final_output", None)
@@ -1137,141 +927,6 @@ class AgenticSearch:
             for attr in ("message", "detail", "data")
         )
 
-    def _select_strategy(self, tool_map: Mapping[str, Any]) -> ToolStrategy | None:
-        if SHARED_SEARCH_TOOL in tool_map:
-            return ToolStrategy(
-                name="shared",
-                search_tool=SHARED_SEARCH_TOOL,
-                fetch_tool=SHARED_FETCH_TOOL if SHARED_FETCH_TOOL in tool_map else None,
-                uses_cql=False,
-            )
-
-        if CONFLUENCE_SEARCH_TOOL in tool_map:
-            return ToolStrategy(
-                name="confluence",
-                search_tool=CONFLUENCE_SEARCH_TOOL,
-                fetch_tool=(
-                    CONFLUENCE_FETCH_TOOL if CONFLUENCE_FETCH_TOOL in tool_map else None
-                ),
-                uses_cql=True,
-            )
-
-        return None
-
-    async def _resolve_cloud_id(
-        self,
-        server: Any,
-        tool_map: Mapping[str, Any],
-        strategy: ToolStrategy,
-    ) -> str | None:
-        selected_tools = [tool_map[strategy.search_tool]]
-        if strategy.fetch_tool and strategy.fetch_tool in tool_map:
-            selected_tools.append(tool_map[strategy.fetch_tool])
-
-        if not any(self._tool_accepts_param(tool, "cloudId") for tool in selected_tools):
-            return None
-
-        return self.atlassian_cloud_id or None
-
-    def _build_search_arguments(
-        self,
-        tool: Any,
-        *,
-        query: str,
-        cloud_id: str | None,
-        use_cql: bool,
-    ) -> dict[str, Any]:
-        arguments: dict[str, Any] = {}
-        value = self._build_cql_query(query) if use_cql else query
-        query_key = self._first_schema_key(
-            tool,
-            ("cql", "query", "searchQuery", "q", "text", "prompt"),
-        )
-        if query_key:
-            arguments[query_key] = value
-
-        limit_key = self._first_schema_key(
-            tool,
-            ("limit", "maxResults", "pageSize", "numResults"),
-        )
-        if limit_key:
-            arguments[limit_key] = self.max_results
-
-        space_key = self._first_schema_key(tool, ("space", "spaceKey"))
-        if space_key and self.confluence_space and not use_cql:
-            arguments[space_key] = self.confluence_space
-
-        if cloud_id and self._tool_accepts_param(tool, "cloudId"):
-            arguments["cloudId"] = cloud_id
-
-        if not arguments:
-            raise RuntimeError(f"Could not determine search arguments for tool '{tool.name}'.")
-
-        return arguments
-
-    def _build_fetch_arguments(
-        self,
-        tool: Any,
-        document: DocumentResult,
-        cloud_id: str | None,
-    ) -> dict[str, Any]:
-        arguments: dict[str, Any] = {}
-
-        ari_key = self._first_schema_key(tool, ("ari", "resourceAri", "resourceARI", "resourceId"))
-        if ari_key and document.ari:
-            arguments[ari_key] = document.ari
-
-        id_key = self._first_schema_key(tool, ("pageId", "id", "contentId", "entityId"))
-        if id_key and document.identifier and id_key not in arguments:
-            arguments[id_key] = document.identifier
-
-        if cloud_id and self._tool_accepts_param(tool, "cloudId"):
-            arguments["cloudId"] = cloud_id
-
-        body_format_key = self._first_schema_key(tool, ("bodyFormat", "format"))
-        if body_format_key:
-            arguments[body_format_key] = "markdown"
-
-        if not arguments:
-            raise RuntimeError(f"Could not determine fetch arguments for tool '{tool.name}'.")
-
-        return arguments
-
-    async def _enrich_documents(
-        self,
-        server: Any,
-        tool: Any,
-        documents: Sequence[DocumentResult],
-        cloud_id: str | None,
-        fetch_errors: list[dict[str, str]],
-    ) -> list[DocumentResult]:
-        enriched: list[DocumentResult] = []
-        for document in documents[:MAX_FETCH_RESULTS]:
-            try:
-                payload = await self._call_tool(
-                    server, tool.name, self._build_fetch_arguments(tool, document, cloud_id)
-                )
-                merged = self._merge_document(
-                    document,
-                    self._normalize_documents(payload, source=tool.name)[:1],
-                    self._extract_text_blob(self._extract_payload(payload)),
-                )
-                enriched.append(merged)
-            except Exception as exc:
-                fetch_errors.append(
-                    {
-                        "tool": tool.name,
-                        "document": document.title,
-                        "error_type": type(exc).__name__,
-                    }
-                )
-                enriched.append(document)
-
-        if len(documents) > MAX_FETCH_RESULTS:
-            enriched.extend(documents[MAX_FETCH_RESULTS:])
-
-        return enriched
-
     async def _synthesize_answer(
         self, query: str, documents: Sequence[DocumentResult]
     ) -> SynthesizedAnswer:
@@ -1373,12 +1028,6 @@ class AgenticSearch:
     def _extract_payload(self, payload: Any) -> Any:
         return extract_payload(payload)
 
-    def _iter_candidate_dicts(self, value: Any):
-        yield from iter_candidate_dicts(value)
-
-    def _iter_nested_dicts(self, value: Any):
-        yield from iter_nested_dicts(value)
-
     def _extract_text_blob(self, value: Any) -> str | None:
         return extract_text_blob(value)
 
@@ -1386,20 +1035,6 @@ class AgenticSearch:
         schema = getattr(tool, "inputSchema", {}) or {}
         properties = schema.get("properties", {}) or {}
         return key in properties
-
-    def _first_schema_key(self, tool: Any, options: Sequence[str]) -> str | None:
-        schema = getattr(tool, "inputSchema", {}) or {}
-        properties = schema.get("properties", {}) or {}
-        for option in options:
-            if option in properties:
-                return option
-        return None
-
-    def _first_string(self, mapping: Mapping[str, Any], keys: Sequence[str]) -> str | None:
-        return first_string(mapping, keys)
-
-    def _maybe_parse_json(self, text: str) -> Any:
-        return maybe_parse_json(text)
 
     def _build_cql_query(self, query: str) -> str:
         escaped_query = query.replace("\\", "\\\\").replace('"', '\\"')
@@ -1437,6 +1072,7 @@ class AgenticSearch:
         *,
         debug_tool_name: str | None = None,
         server_name: str | None = None,
+        meta: Mapping[str, Any] | None = None,
     ) -> Any:
         logged_tool_name = debug_tool_name or tool_name
         self._set_last_step(f"call_tool:{logged_tool_name}")
@@ -1449,7 +1085,10 @@ class AgenticSearch:
         if logged_tool_name != tool_name:
             call_debug["server_tool_name"] = tool_name
         try:
-            payload = await server.call_tool(tool_name, dict(arguments))
+            if meta is None:
+                payload = await server.call_tool(tool_name, dict(arguments))
+            else:
+                payload = await server.call_tool(tool_name, dict(arguments), meta=dict(meta))
         except Exception as exc:
             call_debug["error_type"] = type(exc).__name__
             call_debug["error_message"] = self._preview_text(str(exc))
@@ -1768,6 +1407,7 @@ class AgenticSearch:
         return None
 
     def _extract_exception_debug_details(self, exc: Exception) -> dict[str, Any]:
+        exc = self._root_exception(exc)
         details: dict[str, Any] = {}
         response = getattr(exc, "response", None)
         response_body = None
@@ -1859,14 +1499,26 @@ class AgenticSearch:
             if key in snapshot
         }
 
+    def _root_exception(self, exc: Exception) -> Exception:
+        current = exc
+        seen: set[int] = set()
+        while id(current) not in seen:
+            seen.add(id(current))
+            next_exc = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+            if not isinstance(next_exc, Exception):
+                break
+            current = next_exc
+        return current
+
     def _debug_snapshot(self, exc: Exception | None = None) -> dict[str, Any]:
         snapshot = self._sanitize_debug_object(self._debug_state or {})
         if self._debug_last_step:
             snapshot["last_step"] = self._debug_last_step
         if exc is not None:
-            snapshot["error_type"] = type(exc).__name__
-            snapshot["error_message"] = self._preview_text(str(exc))
-            snapshot.update(self._extract_exception_debug_details(exc))
+            root_exc = self._root_exception(exc)
+            snapshot["error_type"] = type(root_exc).__name__
+            snapshot["error_message"] = self._preview_text(str(root_exc))
+            snapshot.update(self._extract_exception_debug_details(root_exc))
         return snapshot
 
     def _with_debug(self, raw_response: dict[str, Any], exc: Exception | None = None) -> dict[str, Any]:
@@ -1972,11 +1624,12 @@ class AgenticSearch:
                 parsed_payload.get("query", query),
                 parsed_payload.get("attempts", []),
             )
+        root_exc = self._root_exception(exc)
         raw_response = {
             "status": status,
             "query": query,
             "model": self.model,
-            "error_type": type(exc).__name__,
+            "error_type": type(root_exc).__name__,
         }
         return {
             "answer": (
@@ -1984,7 +1637,7 @@ class AgenticSearch:
                 "again in a moment."
             ),
             "citations": [],
-            "raw_response": self._with_debug(raw_response, exc),
+            "raw_response": self._with_debug(raw_response, root_exc),
         }
 
     def _parse_required_search_tool_error(

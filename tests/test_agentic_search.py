@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from agents.run_context import RunContextWrapper
 from mcp.types import CallToolResult, Tool
 
 from agentic_search import (
@@ -18,6 +19,8 @@ from agentic_search import (
     PAYLOAD_PREVIEW_CHAR_LIMIT,
     REQUIRED_SEARCH_TOOL_MISSING_MESSAGE,
     REQUIRED_SEARCH_TOOL_NOT_CALLED_MESSAGE,
+    ATLASSIAN_SERVER_KEY,
+    MCPServerBinding,
     SHARED_FETCH_TOOL,
     SHARED_SEARCH_TOOL,
     SynthesizedAnswer,
@@ -42,13 +45,13 @@ class FakeServer:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def list_tools(self):
+    async def list_tools(self, *args, **kwargs):
         self.list_tools_calls += 1
         if self.list_tools_error:
             raise self.list_tools_error
         return self.tools
 
-    async def call_tool(self, tool_name, arguments):
+    async def call_tool(self, tool_name, arguments, meta=None):
         self.calls.append((tool_name, arguments))
         if tool_name in self.call_errors:
             raise self.call_errors[tool_name]
@@ -143,7 +146,7 @@ def make_github_tools() -> list[Tool]:
     ]
 
 
-def test_build_discovered_function_tool_sanitizes_schema_before_function_tool_creation():
+def test_build_scoped_mcp_server_sanitizes_schema_before_sdk_tool_conversion():
     search = make_search()
     tool = make_tool(
         SHARED_SEARCH_TOOL,
@@ -171,17 +174,18 @@ def test_build_discovered_function_tool_sanitizes_schema_before_function_tool_cr
         schema_extras={"patternProperties": {".*": {"type": "string"}}},
     )
 
-    captured: dict[str, object] = {}
+    scoped_server = search._build_scoped_mcp_server(
+        MCPServerBinding(
+            key=ATLASSIAN_SERVER_KEY,
+            name="atlassian-rovo",
+            url="https://example.com/mcp",
+            server=FakeServer(tools=[tool]),
+        )
+    )
+    public_tools = asyncio.run(scoped_server.list_tools())
 
-    def fake_function_tool(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(**kwargs)
-
-    with patch("agentic_search.FunctionTool", side_effect=fake_function_tool):
-        function_tool = search._build_discovered_function_tool(FakeServer(), tool, [], [])
-
-    assert function_tool.name == SHARED_SEARCH_TOOL
-    assert captured["params_json_schema"] == {
+    assert [tool.name for tool in public_tools] == [SHARED_SEARCH_TOOL]
+    assert public_tools[0].inputSchema == {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Natural language query."},
@@ -200,7 +204,7 @@ def test_build_discovered_function_tool_sanitizes_schema_before_function_tool_cr
         },
         "required": ["query", "filters"],
     }
-    serialized_schema = json.dumps(captured["params_json_schema"])
+    serialized_schema = json.dumps(public_tools[0].inputSchema)
     assert "additionalProperties" not in serialized_schema
     assert "patternProperties" not in serialized_schema
 
@@ -214,10 +218,14 @@ class FakeRunResult:
         return self._synthesized
 
 
+async def get_agent_tools(agent):
+    return await agent.get_all_tools(RunContextWrapper(context=None))
+
+
 async def invoke_discovered_tools(agent, tool_calls: list[tuple[str, dict]]) -> None:
-    tool_map = {tool.name: tool for tool in agent.tools}
+    tool_map = {tool.name: tool for tool in await get_agent_tools(agent)}
     for tool_name, arguments in tool_calls:
-        await tool_map[tool_name].on_invoke_tool(None, json.dumps(arguments))
+        await tool_map[tool_name].on_invoke_tool(RunContextWrapper(context=None), json.dumps(arguments))
 
 
 def make_tool_not_found_error(message: str = "Method not found") -> RuntimeError:
@@ -389,7 +397,7 @@ def test_default_mode_lists_tools_and_uses_agent_tool_wrapper(rovo_search_struct
 
     async def fake_runner(agent, prompt, **_kwargs):
         assert prompt == "What is Beam Benefits?"
-        assert {tool.name for tool in agent.tools} == {SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL}
+        assert {tool.name for tool in await get_agent_tools(agent)} == {SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL}
         await invoke_discovered_tools(
             agent,
             [
@@ -459,7 +467,7 @@ def test_search_discovers_github_tools_and_injects_configured_org(rovo_search_st
 
     async def fake_runner(agent, prompt, **_kwargs):
         assert prompt == "What is Beam Benefits?"
-        assert {tool.name for tool in agent.tools} == {
+        assert {tool.name for tool in await get_agent_tools(agent)} == {
             SHARED_SEARCH_TOOL,
             SHARED_FETCH_TOOL,
             f"{GITHUB_TOOL_NAME_PREFIX}search_repositories",
@@ -529,7 +537,7 @@ def test_allowlist_excludes_non_search_and_fetch_tools(rovo_search_structured_re
     search = make_search()
 
     async def fake_runner(agent, prompt, **_kwargs):
-        assert {tool.name for tool in agent.tools} == {SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL}
+        assert {tool.name for tool in await get_agent_tools(agent)} == {SHARED_SEARCH_TOOL, SHARED_FETCH_TOOL}
         await invoke_discovered_tools(agent, [(SHARED_SEARCH_TOOL, {"query": prompt})])
         return FakeRunResult(
             SynthesizedAnswer(
@@ -1173,9 +1181,9 @@ def test_local_mode_configures_async_openai_client_and_chat_completions_api(monk
     )
 
     async def fake_runner(agent, prompt, **_kwargs):
-        tool = next(tool for tool in agent.tools if tool.name == SHARED_SEARCH_TOOL)
+        tool = next(tool for tool in await get_agent_tools(agent) if tool.name == SHARED_SEARCH_TOOL)
         await tool.on_invoke_tool(
-            None,
+            RunContextWrapper(context=None),
             json.dumps(
                 {
                     "query": prompt,
